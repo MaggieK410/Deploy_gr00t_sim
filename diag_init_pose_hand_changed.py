@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""
+diag_init_pose.py — minimal diagnostic for the sim init-pose problem.
+
+Isolates the controller question from the VLA. We load the env, read
+state[0] from a training parquet, send that pose (and action[0]) to the
+controller repeatedly, and print whether the measured joints actually
+converge. No policy, no attention capture, no chunked inference.
+
+Three modes (pick with --mode):
+
+  introspect   — build env, env.reset(), dump controller config + part
+                 controllers + action_spec + measured joints. Don't step.
+
+  drive-state  — repeatedly send state[0] as the env action (clipped /
+                 padded per-part via robot.create_action_vector). Use this
+                 to test whether the controller can drive to a known pose.
+
+  drive-action — repeatedly send action[0] from the parquet (the EXACT
+                 vector the env saw at data collection time, planner-
+                 permuted, after running it through model_action_to_env_action).
+                 This is the cleanest "does the controller still work
+                 the same way it did during training?" check.
+
+Usage:
+  python creo-g1-teleop/diag_init_pose.py \\
+         --controller-config ../controller_config.json \\
+         --dataset ../red_ball_large_sim_no_legs/ \\
+         --mode drive-state \\
+         --steps 80 --output diag_video.mp4
+
+If --controller-config is omitted, robosuite's default JOINT_POSITION
+controller is used (the same one `collect_human_demonstrations.py` loads
+with `--controller JOINT_POSITION`).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+
+import robosuite
+from robosuite import make
+
+_THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR))
+# `load_controller_config` is at robosuite.load_controller_config in ≤1.4,
+# but in robosuite 1.5+ it moved (the GR1 path now goes through composite
+# controllers loaded automatically from `robots/default_gr1.json` when
+# `controller_configs=None` is passed to make()). Try a few import paths;
+# if none work, we leave controller_configs unset at make() time, which
+# triggers robosuite's auto-load of the robot's default config.
+load_controller_config = None
+for _mod, _name in [
+    ("robosuite",                                  "load_controller_config"),
+    ("robosuite.controllers",                      "load_controller_config"),
+    ("robosuite.controllers",                      "load_part_controller_config"),
+    ("robosuite.controllers.controller_factory",   "load_controller_config"),
+    ("robosuite.controllers.controller_factory",   "load_part_controller_config"),
+]:
+    try:
+        _m = __import__(_mod, fromlist=[_name])
+        load_controller_config = getattr(_m, _name)
+        break
+    except (ImportError, AttributeError):
+        continue
+
+
+# ── Joint conventions (same as deploy_groot_sim_humandemo.py) ───────
+RIGHT_ARM_JOINTS = [
+    "robot0_r_shoulder_pitch", "robot0_r_shoulder_roll",
+    "robot0_r_shoulder_yaw",   "robot0_r_elbow_pitch",
+    "robot0_r_wrist_yaw",      "robot0_r_wrist_roll", "robot0_r_wrist_pitch",
+]
+LEFT_ARM_JOINTS = [
+    "robot0_l_shoulder_pitch", "robot0_l_shoulder_roll",
+    "robot0_l_shoulder_yaw",   "robot0_l_elbow_pitch",
+    "robot0_l_wrist_yaw",      "robot0_l_wrist_roll", "robot0_l_wrist_pitch",
+]
+# PLANNER_FROM_LOGICAL[planner_idx] gives the logical slot that the value at
+# planner position `planner_idx` belongs to. i.e. planner[i] = logical[PFL[i]].
+# Used directly in action18_to_arms to un-interleave the planner-permuted
+# action vector back into [waist(3), L_arm(7), R_arm(7)] logical order.
+PLANNER_FROM_LOGICAL = [
+    0, 1, 2,
+    3, 10, 4, 11, 5, 12, 6, 13, 7, 14, 8, 15, 9, 16,
+]
+
+ARM_PART_NAMES = {"right", "right_arm", "left", "left_arm"}
+GRIPPER_PART_NAMES = {"right_gripper", "left_gripper", "right_hand", "left_hand"}
+
+# Dex3 6-DOF gripper qpos indices and pick-order — verbatim from
+# collect_data_with_groot.py. Used to read current finger angles so we can
+# compute delta-mode gripper commands (robosuite 1.5+ keeps the gripper
+# controller in delta mode regardless of `control_delta: false` in the JSON,
+# so we have to convert absolute targets to deltas in user code).
+QPOS_INDICES_RIGHT_HAND = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+QPOS_INDICES_LEFT_HAND  = [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+HAND_DOF_PICK = [0, 1, 4, 6, 8, 10]
+
+# Per-finger reference poses (from collect_data_with_groot.py:236-243).
+# Layout matches what the gripper action vector expects after `[::-1]` in
+# build_env_action — the same convention as state.right_hand[1:7] in the
+# LeRobot dataset.
+HAND_OPEN   = np.array([0.003, 0.003, 0.000, 0.000, 0.000, 0.000], dtype=np.float32)
+HAND_CLOSED = np.array([0.834, 0.399, 0.416, 0.425, 0.344, 0.256], dtype=np.float32)
+
+
+def _hand_qpos(env, qpos_indices):
+    """Read the 6 actuated dex3 finger angles in the convention used by
+    state.right_hand / HAND_OPEN / HAND_CLOSED."""
+    full = np.array(env.sim.data.qpos[qpos_indices], dtype=np.float32)
+    return full[HAND_DOF_PICK][::-1]
+
+
+def arm_qpos(env, joint_names):
+    return np.array(
+        [env.sim.data.qpos[env.sim.model.get_joint_qpos_addr(n)] for n in joint_names],
+        dtype=np.float32,
+    )
+
+
+def build_env(args):
+    """Build the robosuite env.
+
+    Controller resolution order:
+      1. If --controller-config is given → load that JSON.
+      2. Else if robosuite exposes a load_controller_config helper → use it.
+      3. Else (robosuite 1.5+ default path) → pass controller_configs=None to
+         robosuite.make(), which auto-loads the robot's default config
+         (e.g. robots/default_gr1.json for GR1ArmsOnly).
+    """
+    cc = None
+    if args.controller_config:
+        cc_path = Path(args.controller_config)
+        with open(cc_path) as f:
+            cc = json.load(f)
+        print(f"[diag] controller: custom JSON {cc_path}")
+    elif load_controller_config is not None:
+        cc = load_controller_config(default_controller=args.controller_type)
+        print(f"[diag] controller: robosuite default {args.controller_type}")
+    else:
+        print(f"[diag] controller: robosuite auto-default for {args.robot} "
+              "(passing controller_configs=None to make())")
+
+    if cc is not None:
+        print(f"[diag] controller config dump:\n{json.dumps(cc, indent=2)}")
+
+    env = make(
+        args.env,
+        args.robot,
+        controller_configs=cc,
+        has_renderer=False,
+        ignore_done=True,
+        use_camera_obs=True,
+        control_freq=int(args.fps),
+        use_object_obs=True,
+        camera_names=args.camera,
+        camera_heights=args.image_height,
+        camera_widths=args.image_width,
+        horizon=args.steps + 50,
+    )
+    return env
+
+
+def dump_env_intro(env):
+    low, high = env.action_spec
+    print(f"[diag] env.action_dim = {env.action_dim}")
+    print(f"[diag] action_spec.low  = {np.round(np.asarray(low),  3).tolist()}")
+    print(f"[diag] action_spec.high = {np.round(np.asarray(high), 3).tolist()}")
+    robot = env.robots[0]
+    pc = getattr(robot, "part_controllers", None)
+    if pc is not None:
+        print("[diag] part_controllers:")
+        delta_arm = False
+        for k, v in pc.items():
+            cd = getattr(v, "control_dim", None) or getattr(v, "action_dim", None)
+            ct = type(v).__name__
+            in_type = getattr(v, "input_type", "?")
+            cd_attr = getattr(v, "control_delta", None)
+            print(f"   {k:<18} dim={cd}  type={ct}  input_type={in_type}  control_delta={cd_attr}")
+            if k in ARM_PART_NAMES and (str(in_type) == "delta" or cd_attr is True):
+                delta_arm = True
+        if delta_arm:
+            print("[diag] !! WARNING: arm controllers are in DELTA mode. The training data's "
+                  "action values are absolute joint angles in radians (e.g. -1.58). With a "
+                  "delta-mode controller they'll be clipped to [-1, 1] and applied as small "
+                  "per-step deltas — the robot WILL NOT reach the target pose in a chunk of 16 "
+                  "steps. Use a custom controller_config.json with input_type='absolute' to "
+                  "interpret the model's outputs correctly.")
+    else:
+        print("[diag] no part_controllers attribute (robosuite <1.5)")
+
+
+def load_dataset_state_and_action(args):
+    """Return (state_28, action_18) from episode_{args.episode}.parquet, step args.step."""
+    p = Path(args.dataset)
+    if p.is_dir():
+        p = p / "data" / "chunk-000" / f"episode_{args.episode:06d}.parquet"
+    print(f"[diag] reading {p} step {args.step}")
+    df = pd.read_parquet(p)
+    s = np.asarray(df["observation.state"].iloc[args.step], dtype=np.float32)
+    a = np.asarray(df["action"].iloc[args.step],            dtype=np.float32)
+    print(f"[diag] dataset state[step] len={len(s)}")
+    print(f"[diag] dataset action[step] len={len(a)}")
+    return s, a
+
+
+def load_dataset_action_trajectory(args):
+    """Return action[step:step+args.steps] as a (T, 18) array from the parquet."""
+    p = Path(args.dataset)
+    if p.is_dir():
+        p = p / "data" / "chunk-000" / f"episode_{args.episode:06d}.parquet"
+    print(f"[diag] reading {p} steps [{args.step}, {args.step + args.steps})")
+    df = pd.read_parquet(p)
+    actions = []
+    end = min(args.step + args.steps, len(df))
+    for i in range(args.step, end):
+        actions.append(np.asarray(df["action"].iloc[i], dtype=np.float32))
+    actions = np.stack(actions, axis=0)
+    print(f"[diag] loaded action trajectory: shape {actions.shape}")
+    return actions
+
+
+def state28_to_arms(s28):
+    return (
+        s28[14:21].astype(np.float32),   # right_arm  (7)
+        s28[0:7].astype(np.float32),     # left_arm   (7)
+        s28[21:28].astype(np.float32),   # right_hand (7: grip + 6 fingers)
+        s28[7:14].astype(np.float32),    # left_hand
+    )
+
+
+def action18_to_arms(a18):
+    """Unpack an 18-D dataset action into (rarm, larm, r_trig).
+
+    Layout (from modality.json): action = [upper(17), r_trig(1)]. `upper` is
+    [waist(3), L_arm(0), R_arm(0), L_arm(1), R_arm(1), ..., L_arm(6), R_arm(6)]
+    — i.e. waist + planner-interleaved arms (planner[i] = logical[PFL[i]]).
+
+    To recover the logical [waist(3), L_arm(7), R_arm(7)] vector we use
+    PLANNER_FROM_LOGICAL directly: each planner-position's value goes to the
+    logical slot named by PFL[planner_idx].
+    """
+    upper17 = a18[:17]
+    r_trig = float(a18[17])
+    logical = np.empty(17, dtype=np.float32)
+    for planner_idx in range(17):
+        logical[PLANNER_FROM_LOGICAL[planner_idx]] = upper17[planner_idx]
+    larm = logical[3:10]
+    rarm = logical[10:17]
+    return rarm.astype(np.float32), larm.astype(np.float32), r_trig
+
+
+def _gripper_slot_sizes(env):
+    """Return (right_hand_dim, left_hand_dim) such that the totals match the
+    env's action_dim. Layout is always [rarm(7), larm(7), rh(N), lh(M)].
+
+    For the default `default_gr1.json` controller: env.action_dim=24,
+    so rh+lh=10 → (5, 5).
+    For the masterthesis custom JOINT_POSITION config: env.action_dim=26,
+    so rh+lh=12 → (6, 6).
+    """
+    total_hand = env.action_dim - 14
+    if total_hand < 0:
+        raise ValueError(f"env.action_dim={env.action_dim} < 14 (two 7-DOF arms)")
+    rh = total_hand // 2
+    lh = total_hand - rh
+    return rh, lh
+
+
+def _gripper_targets_from_r_trig(r_trig):
+    """Map r_trig ∈ [0, 1] to per-finger absolute targets via linear interp
+    between HAND_OPEN and HAND_CLOSED. r_trig=0 → all fingers fully open;
+    r_trig=1 → all fingers at the master-thesis fully-closed pose."""
+    t = float(np.clip(r_trig, 0.0, 1.0))
+    return HAND_OPEN + t * (HAND_CLOSED - HAND_OPEN)
+
+
+def _gripper_action_from_targets(env, side, target_rh):
+    """Convert an absolute 6-DOF finger target into the action-slot vector
+    the gripper controller actually expects.
+
+    For robosuite 1.5+ default GR1, the gripper is reported as JOINT_POSITION
+    but is internally locked in DELTA mode (`control_delta: false` in the JSON
+    is silently ignored). So we read the current finger angles and emit
+    `clip(target - current, -1, 1)` as the action — that drives the joint
+    toward `target` at one delta-step per env.step.
+
+    If the gripper does honor absolute mode (e.g. robosuite ≤ 1.4 with the
+    masterthesis config), pass target directly: it'll be interpreted as the
+    joint target.
+    """
+    if side == "right":
+        qpos_idx = QPOS_INDICES_RIGHT_HAND
+        ctrl_key = "right_gripper"
+    else:
+        qpos_idx = QPOS_INDICES_LEFT_HAND
+        ctrl_key = "left_gripper"
+
+    pc = getattr(env.robots[0], "part_controllers", None)
+    ctrl = pc.get(ctrl_key) if pc is not None else None
+    in_type = str(getattr(ctrl, "input_type", "")).lower() if ctrl is not None else ""
+    is_delta = (in_type == "delta") or (getattr(ctrl, "control_delta", None) is True)
+
+    if is_delta:
+        current = _hand_qpos(env, qpos_idx)
+        return np.clip(target_rh - current, -1.0, 1.0)
+    return target_rh.astype(np.float32)
+
+
+def build_env_action(env, rarm, larm, r_trig=0.0):
+    """Build the flat env action vector for the env's actuation layout.
+
+    Robosuite's `actuation_part_names` order is NOT guaranteed to be
+    [right_arm, left_arm, right_gripper, left_gripper]. For the default
+    `default_gr1.json` config it's actually [right, right_gripper, left,
+    left_gripper] — so a manual concat in [rarm, larm, rh, lh] order
+    cross-wires the right_gripper slots with the left_arm slots and breaks
+    the rollout (the symptom: left arm collapses to zero, right gripper
+    receives joint-angle-magnitude commands and goes berserk).
+
+    Preferred path: hand a per-part dict to `robot.create_action_vector`,
+    which uses the authoritative `actuation_part_names` ordering and the
+    correct per-part action-input dim. Falls back to manual concat for
+    robosuite ≤ 1.4 where that API isn't available.
+
+    Gripper convention: `r_trig` broadcast across all right-gripper slots
+    (delta in [-1, 1]; positive = close fingers). Left gripper stays at 0.
+    """
+    rarm = np.asarray(rarm, dtype=np.float32)
+    larm = np.asarray(larm, dtype=np.float32)
+    r_trig_clipped = float(np.clip(r_trig, -1.0, 1.0))
+    rh_dim, lh_dim = _gripper_slot_sizes(env)
+
+    if rh_dim == 6:
+        # Custom masterthesis dex3 controller — per-finger interpolation
+        # between HAND_OPEN / HAND_CLOSED, then delta-vs-absolute conversion
+        # depending on what the gripper controller actually expects.
+        target_rh = _gripper_targets_from_r_trig(r_trig_clipped)
+        target_lh = HAND_OPEN.copy()   # left always open
+        rh = _gripper_action_from_targets(env, "right", target_rh)
+        lh = _gripper_action_from_targets(env, "left",  target_lh)
+    else:
+        # Default GR1 (5-slot) gripper — broadcast r_trig as before.
+        rh = np.full(rh_dim, r_trig_clipped, dtype=np.float32)
+        lh = np.zeros(lh_dim, dtype=np.float32)
+
+    robot = env.robots[0]
+    pc = getattr(robot, "part_controllers", None)
+    if pc is not None and hasattr(robot, "create_action_vector"):
+        action_dict = {}
+        for name in pc.keys():
+            if name in ARM_PART_NAMES:
+                action_dict[name] = rarm if "right" in name else larm
+            elif name in GRIPPER_PART_NAMES:
+                action_dict[name] = rh if "right" in name else lh
+            else:
+                # Unknown part — zero-fill to the slot's nominal control_dim
+                # so robosuite's create_action_vector doesn't reject the dict.
+                cd = getattr(pc[name], "control_dim", None) or \
+                     getattr(pc[name], "action_dim", None) or 1
+                action_dict[name] = np.zeros(int(cd), dtype=np.float32)
+        try:
+            action = np.asarray(robot.create_action_vector(action_dict),
+                                dtype=np.float32)
+            if action.shape[0] == env.action_dim:
+                return action
+            print(f"[diag] WARNING: create_action_vector returned "
+                  f"{action.shape[0]}-D, expected {env.action_dim}; "
+                  "falling back to manual concat")
+        except Exception as e:
+            print(f"[diag] WARNING: create_action_vector failed ({e}); "
+                  "falling back to manual concat")
+
+    # Fallback (robosuite ≤ 1.4 / custom 26-D layout): assume legacy
+    # [rarm, larm, rh[::-1], lh[::-1]] ordering.
+    action = np.concatenate([rarm, larm, rh[::-1], lh[::-1]]).astype(np.float32)
+    if action.shape[0] != env.action_dim:
+        raise RuntimeError(
+            f"[diag] built {action.shape[0]}-D action but env.action_dim={env.action_dim}"
+        )
+    return action
+
+
+def get_frame(env, args):
+    obs = env._get_observations()
+    key = f"{args.camera}_image"
+    if key not in obs:
+        return None
+    img = np.flipud(obs[key]).copy()
+    return img.astype(np.uint8)
+
+
+
+def run_replay(env, args, action_traj_18):
+    """Replay a recorded action trajectory step by step. For each row in
+    `action_traj_18` we extract (rarm, larm, r_trig), build the 26-D env
+    action, and step the env once. Saves video and prints per-step error
+    vs the expected next state (if dataset has next-state info)."""
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    print(f"\n[diag] === replay-trajectory: {len(action_traj_18)} steps ===")
+    log_every = max(1, len(action_traj_18) // 12)
+    for t, a18 in enumerate(action_traj_18):
+        rarm, larm, r_trig = action18_to_arms(a18)
+        env_action = build_env_action(env, rarm, larm, r_trig)
+        if t == 0:
+            print(f"[diag] action[0] (18-D): {np.round(a18, 3).tolist()}")
+            print(f"[diag] target rarm     : {np.round(rarm, 3).tolist()}")
+            print(f"[diag] target larm     : {np.round(larm, 3).tolist()}")
+            print(f"[diag] r_trig          : {r_trig:+.3f}")
+            print(f"[diag] env_action (26-D): {np.round(env_action, 3).tolist()}")
+        obs, _, done, _ = env.step(env_action)
+        if t % log_every == 0 or t == len(action_traj_18) - 1:
+            ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+            la = arm_qpos(env, LEFT_ARM_JOINTS)
+            err_r = float(np.max(np.abs(ra - rarm)))
+            err_l = float(np.max(np.abs(la - larm)))
+            print(f"[diag] t={t:3d}  R_elbow={ra[3]:+.3f} (target {rarm[3]:+.3f})  "
+                  f"L_elbow={la[3]:+.3f} (target {larm[3]:+.3f})  "
+                  f"max|err|_R={err_r:.3f}  max|err|_L={err_l:.3f}  r_trig={r_trig:+.3f}")
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            print(f"[diag] env signaled done at t={t}")
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+
+def run_drive(env, args, target_rarm, target_larm, r_trig, label):
+    """Send the same action repeatedly and log measured-joint convergence."""
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    env_action = build_env_action(env, target_rarm, target_larm, r_trig)
+    print(f"\n[diag] === {label} ===")
+    print(f"[diag] target right_arm = {np.round(target_rarm, 3).tolist()}")
+    print(f"[diag] target left_arm  = {np.round(target_larm, 3).tolist()}")
+    print(f"[diag] r_trig           = {r_trig:+.3f}")
+    print(f"[diag] env_action ({env_action.shape[0]}-D) = "
+          f"{np.round(env_action, 3).tolist()}")
+
+    log_every = max(1, args.steps // 10)
+    err_history = []
+    for t in range(args.steps):
+        obs, _, done, _ = env.step(env_action)
+        ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+        la = arm_qpos(env, LEFT_ARM_JOINTS)
+        err_r = float(np.max(np.abs(ra - target_rarm)))
+        err_l = float(np.max(np.abs(la - target_larm)))
+        err_history.append((err_r, err_l))
+        if t % log_every == 0 or t == args.steps - 1:
+            print(f"[diag] t={t:3d}  max|err|_R={err_r:.3f}  max|err|_L={err_l:.3f}  "
+                  f"R_elbow={ra[3]:+.3f}  L_elbow={la[3]:+.3f}")
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+    # Final measured pose & summary
+    ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+    la = arm_qpos(env, LEFT_ARM_JOINTS)
+    print(f"[diag] final right_arm  = {np.round(ra, 3).tolist()}")
+    print(f"[diag] final left_arm   = {np.round(la, 3).tolist()}")
+    print(f"[diag] final |err|_R    = {np.max(np.abs(ra - target_rarm)):.3f}")
+    print(f"[diag] final |err|_L    = {np.max(np.abs(la - target_larm)):.3f}")
+    if err_history:
+        first_err = (err_history[0][0] + err_history[0][1]) / 2
+        last_err  = (err_history[-1][0] + err_history[-1][1]) / 2
+        if last_err < 0.05:
+            print("[diag] VERDICT: converged ✓ (controller drives to the target)")
+        elif last_err < first_err * 0.5:
+            print(f"[diag] VERDICT: partially converged (err {first_err:.3f} → {last_err:.3f}). "
+                  "Try more --steps or check controller gains.")
+        else:
+            print(f"[diag] VERDICT: NOT converging (err {first_err:.3f} → {last_err:.3f}). "
+                  "Likely a controller-mode mismatch (absolute vs delta) or wrong action layout.")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", default="introspect",
+                   choices=("introspect", "drive-state", "drive-action",
+                            "replay-trajectory"),
+                   help="introspect: just dump env; "
+                        "drive-state: HOLD dataset state[step] as the action for --steps; "
+                        "drive-action: HOLD dataset action[step] for --steps; "
+                        "replay-trajectory: FOLLOW dataset action[step:step+steps].")
+    p.add_argument("--env",    default="Lift")
+    p.add_argument("--robot",  default="GR1ArmsOnly")
+    p.add_argument("--camera", default="frontview")
+    p.add_argument("--fps", type=int, default=20)
+    p.add_argument("--image-width",  type=int, default=256)
+    p.add_argument("--image-height", type=int, default=256)
+    p.add_argument("--controller-config", default=None,
+                   help="JSON path. If omitted, use robosuite default.")
+    p.add_argument("--controller-type", default="JOINT_POSITION")
+    p.add_argument("--dataset", default=None,
+                   help="Path to a LeRobot v3 no-legs dataset folder or parquet.")
+    p.add_argument("--episode", type=int, default=0)
+    p.add_argument("--step",    type=int, default=0)
+    p.add_argument("--steps",   type=int, default=80,
+                   help="How many env.step()s to send the target action for.")
+    p.add_argument("--output",  default=None,
+                   help="If set, save the diagnostic rollout to this mp4.")
+    p.add_argument("--ignore-done", action="store_true")
+    p.add_argument("--r-trig", type=float, default=None,
+                   help="Override the right-gripper command (default: read from dataset).")
+
+    args = p.parse_args()
+
+    print(f"[diag] robosuite {robosuite.__version__}  env={args.env}  robot={args.robot}")
+    env = build_env(args)
+
+    print("\n--- BEFORE env.reset() ---")
+    # Some robosuite versions populate sim only after reset; skip dump here
+    print("\n--- AFTER env.reset() ---")
+    env.reset()
+    dump_env_intro(env)
+    ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+    la = arm_qpos(env, LEFT_ARM_JOINTS)
+    print(f"[diag] reset right_arm = {np.round(ra, 3).tolist()}")
+    print(f"[diag] reset left_arm  = {np.round(la, 3).tolist()}")
+
+    if args.mode == "introspect":
+        print("\n[diag] introspect mode — not stepping. Pass --mode drive-state or drive-action.")
+        env.close()
+        return
+
+    if args.dataset is None:
+        print("[diag] ERROR: --dataset is required for drive modes.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.mode == "replay-trajectory":
+        traj = load_dataset_action_trajectory(args)
+        run_replay(env, args, traj)
+    else:
+        s28, a18 = load_dataset_state_and_action(args)
+        if args.mode == "drive-state":
+            rarm, larm, _rh, _lh = state28_to_arms(s28)
+            r_trig = args.r_trig if args.r_trig is not None else 0.0
+            run_drive(env, args, rarm, larm, r_trig, "drive to state[step]")
+        else:  # drive-action
+            rarm, larm, r_trig_ds = action18_to_arms(a18)
+            r_trig = args.r_trig if args.r_trig is not None else r_trig_ds
+            run_drive(env, args, rarm, larm, r_trig, "drive to action[step]")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
