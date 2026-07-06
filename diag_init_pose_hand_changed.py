@@ -657,17 +657,24 @@ def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
 
 
 def _write_gripper_qpos(env, target_rh6, target_lh6):
-    """Directly write the 11 finger qpos slots for both hands and zero their
-    qvel. Bypasses the FourierRightHand/FourierLeftHand controller entirely
-    (which seems to only be capable of moving joints by ~0.02 rad regardless
-    of input).
+    """Set the 11 dex3 finger positions per hand via the robosuite-blessed
+    `robot.set_gripper_joint_positions(...)` API — same call the master-
+    thesis collect_data_with_groot.py:148-150 uses. This is a HIGH-LEVEL
+    write: it not only sets sim.data.qpos on the finger joints, it also
+    updates the gripper controller's internal reference so the PD doesn't
+    swing the joints back to its previous goal on the next env.step.
+    Falls back to a raw sim.data.qpos write if the API is missing.
     """
     target_rh11 = _expand_6_to_11(target_rh6)
     target_lh11 = _expand_6_to_11(target_lh6)
+    robot = env.robots[0]
+    if hasattr(robot, "set_gripper_joint_positions"):
+        robot.set_gripper_joint_positions(target_rh11, "right")
+        robot.set_gripper_joint_positions(target_lh11, "left")
+        return
+    # Fallback for robosuite < 1.5 or if the method got renamed:
     env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND] = target_rh11
     env.sim.data.qpos[QPOS_INDICES_LEFT_HAND]  = target_lh11
-    # Zero the velocities on those joints so the PD sees no velocity error.
-    # In mujoco, qvel indices for hinge joints line up 1:1 with qpos indices.
     env.sim.data.qvel[QPOS_INDICES_RIGHT_HAND] = 0.0
     env.sim.data.qvel[QPOS_INDICES_LEFT_HAND]  = 0.0
     env.sim.forward()
@@ -802,7 +809,11 @@ def run_replay(env, args, action_traj_18):
         # Bypass FourierRightHand controller by writing target finger qpos
         # directly. No-op for the default 5-slot gripper.
         apply_gripper_qpos_bypass(env, r_trig)
+        rh_after_write = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                   dtype=np.float32).copy()
         obs, _, done, _ = env.step(env_action)
+        rh_after_step = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                  dtype=np.float32)
         if t % log_every == 0 or t == len(action_traj_18) - 1:
             ra = arm_qpos(env, RIGHT_ARM_JOINTS)
             la = arm_qpos(env, LEFT_ARM_JOINTS)
@@ -811,6 +822,13 @@ def run_replay(env, args, action_traj_18):
             print(f"[diag] t={t:3d}  R_elbow={ra[3]:+.3f} (target {rarm[3]:+.3f})  "
                   f"L_elbow={la[3]:+.3f} (target {larm[3]:+.3f})  "
                   f"max|err|_R={err_r:.3f}  max|err|_L={err_l:.3f}  r_trig={r_trig:+.3f}")
+            # Gripper qpos tracing: what we wrote, what env.step left it at,
+            # and the max-abs deviation between them. If the drift line stays
+            # small (< 0.05), the write is holding and the fingers ARE closing.
+            drift = np.max(np.abs(rh_after_step - rh_after_write))
+            print(f"[diag]        rh_after_write = {np.round(rh_after_write, 3).tolist()}")
+            print(f"[diag]        rh_after_step  = {np.round(rh_after_step, 3).tolist()}")
+            print(f"[diag]        max|drift|     = {drift:.4f}")
         if writer is not None:
             fr = get_frame(env, args)
             if fr is not None:
