@@ -197,6 +197,126 @@ def dump_env_intro(env):
         print("[diag] no part_controllers attribute (robosuite <1.5)")
 
 
+def dump_joint_inventory(env):
+    """Print every joint's name + qpos addr + current qpos value. Used to
+    verify that the QPOS_INDICES_RIGHT_HAND / LEFT_HAND constants (copied
+    from the master-thesis robosuite version) still point at the right
+    joints in robosuite 1.5+. Also groups joints by keyword so we can
+    quickly see 'hand', 'finger', 'thumb', etc.
+
+    Also dumps `env.robots[0].gripper` info if available — that tells us
+    which joint names robosuite considers to be the actuated gripper joints.
+    """
+    print("\n[diag] --- joint inventory ---")
+    model = env.sim.model
+    data = env.sim.data
+    n_joints = model.njnt
+
+    # Full list, but grouped by keyword.
+    groups = {"HAND": [], "FINGER/THUMB/INDEX/MIDDLE/RING/PINKY": [],
+              "ARM/SHOULDER/ELBOW/WRIST": [], "OTHER": []}
+    for jid in range(n_joints):
+        name = model.joint_id2name(jid) or f"<jid={jid}>"
+        try:
+            addr = model.get_joint_qpos_addr(name)
+            # get_joint_qpos_addr returns int for hinge/slide, tuple for ball/free
+            if isinstance(addr, tuple):
+                lo, hi = addr
+                qpos_val = data.qpos[lo:hi].tolist()
+                addr_str = f"[{lo}:{hi}]"
+                qpos_str = str(np.round(qpos_val, 3).tolist())
+            else:
+                qpos_val = float(data.qpos[addr])
+                addr_str = f"[{addr}]"
+                qpos_str = f"{qpos_val:+.3f}"
+        except Exception as e:
+            addr_str = "??"
+            qpos_str = f"<err {e}>"
+
+        line = f"  {name:<50s}  qpos{addr_str:<10s}  = {qpos_str}"
+        lname = name.lower()
+        if "hand" in lname:
+            groups["HAND"].append(line)
+        elif any(k in lname for k in
+                 ("finger", "thumb", "index", "middle", "ring", "pinky")):
+            groups["FINGER/THUMB/INDEX/MIDDLE/RING/PINKY"].append(line)
+        elif any(k in lname for k in ("shoulder", "elbow", "wrist", "arm")):
+            groups["ARM/SHOULDER/ELBOW/WRIST"].append(line)
+        else:
+            groups["OTHER"].append(line)
+
+    for gname, lines in groups.items():
+        if not lines:
+            continue
+        print(f"\n[diag] === {gname} ({len(lines)} joints) ===")
+        for line in lines:
+            print(line)
+
+    # Verify our hardcoded QPOS_INDICES against actual joint names.
+    print("\n[diag] --- QPOS_INDICES_RIGHT_HAND probe ---")
+    for i, addr in enumerate(QPOS_INDICES_RIGHT_HAND):
+        try:
+            val = float(data.qpos[addr])
+        except Exception:
+            val = float("nan")
+        # Reverse-look up which joint has this qpos addr.
+        owner = "??"
+        for jid in range(n_joints):
+            name = model.joint_id2name(jid) or ""
+            try:
+                a = model.get_joint_qpos_addr(name)
+                if isinstance(a, int) and a == addr:
+                    owner = name
+                    break
+                if isinstance(a, tuple) and a[0] <= addr < a[1]:
+                    owner = f"{name}[{addr - a[0]}]"
+                    break
+            except Exception:
+                pass
+        print(f"  qpos[{addr}] = {val:+.3f}   owner = {owner}")
+
+    # Same for left hand.
+    print("\n[diag] --- QPOS_INDICES_LEFT_HAND probe ---")
+    for i, addr in enumerate(QPOS_INDICES_LEFT_HAND):
+        try:
+            val = float(data.qpos[addr])
+        except Exception:
+            val = float("nan")
+        owner = "??"
+        for jid in range(n_joints):
+            name = model.joint_id2name(jid) or ""
+            try:
+                a = model.get_joint_qpos_addr(name)
+                if isinstance(a, int) and a == addr:
+                    owner = name
+                    break
+                if isinstance(a, tuple) and a[0] <= addr < a[1]:
+                    owner = f"{name}[{addr - a[0]}]"
+                    break
+            except Exception:
+                pass
+        print(f"  qpos[{addr}] = {val:+.3f}   owner = {owner}")
+
+    # Also inspect robot.gripper for the joint names it thinks it controls.
+    robot = env.robots[0]
+    for side in ("right", "left"):
+        grippers = getattr(robot, "gripper", None)
+        if isinstance(grippers, dict):
+            g = grippers.get(side)
+        else:
+            g = grippers
+        if g is None:
+            continue
+        joint_names = getattr(g, "_joints", None) or getattr(g, "joints", None) \
+                      or getattr(g, "actuated_joints", None)
+        actuators   = getattr(g, "_actuators", None) or getattr(g, "actuators", None)
+        print(f"\n[diag] gripper.{side} class = {type(g).__name__}")
+        if joint_names is not None:
+            print(f"[diag] gripper.{side} joints ({len(joint_names)}): {list(joint_names)}")
+        if actuators is not None:
+            print(f"[diag] gripper.{side} actuators ({len(actuators)}): {list(actuators)}")
+
+
 def load_dataset_state_and_action(args):
     """Return (state_28, action_18) from episode_{args.episode}.parquet, step args.step."""
     p = Path(args.dataset)
@@ -397,6 +517,126 @@ def get_frame(env, args):
     return img.astype(np.uint8)
 
 
+def run_gripper_probe(env, args):
+    """Diagnostic that isolates the gripper. On every env.step:
+      1. Send zero deltas for both arms (arms should hold near reset pose).
+      2. Send a MAX-magnitude command to the gripper slots (full close).
+      3. Log the qpos delta across the whole mujoco state to find which
+         joints actually move in response.
+
+    If nothing moves in the qpos region we assume is the right hand
+    (QPOS_INDICES_RIGHT_HAND) but SOMETHING moves elsewhere → our indices
+    are stale. If nothing moves anywhere → the gripper controller is
+    genuinely inert and we need to bypass it via
+    `env.robots[0].set_gripper_joint_positions`.
+    """
+    n_steps = args.steps
+    print(f"\n[diag] === gripper-probe: {n_steps} steps ===")
+
+    # Snapshot arm joint positions at reset so we can send them as the
+    # "hold" arm targets (arm controller is absolute-mode so this holds).
+    hold_rarm = arm_qpos(env, RIGHT_ARM_JOINTS)
+    hold_larm = arm_qpos(env, LEFT_ARM_JOINTS)
+    print(f"[diag] arm hold rarm = {np.round(hold_rarm, 3).tolist()}")
+    print(f"[diag] arm hold larm = {np.round(hold_larm, 3).tolist()}")
+
+    # Build a full-close gripper action by forcing r_trig=1.0 inside
+    # build_env_action (which internally lerps HAND_OPEN → HAND_CLOSED and,
+    # for delta-mode grippers, subtracts current qpos to make a delta).
+    n_qpos = env.sim.model.nq
+    qpos_before_first = np.array(env.sim.data.qpos, dtype=np.float32).copy()
+    print(f"[diag] full qpos length = {n_qpos}")
+    print(f"[diag] qpos at reset (rounded, first 40): "
+          f"{np.round(qpos_before_first[:40], 3).tolist()}")
+
+    # Video setup (same as other modes).
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    log_every = max(1, n_steps // 10)
+    cumulative_delta = np.zeros(n_qpos, dtype=np.float32)
+    for t in range(n_steps):
+        qpos_before = np.array(env.sim.data.qpos, dtype=np.float32).copy()
+        env_action = build_env_action(env, hold_rarm, hold_larm, r_trig=1.0)
+        obs, _, done, _ = env.step(env_action)
+        qpos_after = np.array(env.sim.data.qpos, dtype=np.float32)
+        step_delta = qpos_after - qpos_before
+        cumulative_delta += step_delta
+
+        if t == 0 or (t + 1) % log_every == 0 or t == n_steps - 1:
+            # Which qpos entries moved by > 1e-4 this step?
+            moved = [(i, float(step_delta[i]))
+                     for i in range(n_qpos) if abs(step_delta[i]) > 1e-4]
+            print(f"[diag] t={t:3d}  moved-this-step (|Δqpos|>1e-4): "
+                  f"{len(moved)} joints")
+            for i, dv in moved[:30]:
+                # Look up joint owner for this qpos index.
+                owner = _qpos_owner(env, i)
+                print(f"       qpos[{i:3d}] Δ={dv:+.4f}  cumΔ={cumulative_delta[i]:+.4f}  owner={owner}")
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+    # Final: which qpos entries moved the most over the whole probe?
+    print(f"\n[diag] --- gripper-probe summary ---")
+    idx_sorted = np.argsort(-np.abs(cumulative_delta))
+    top = idx_sorted[:20]
+    print(f"[diag] top 20 qpos slots by |cumulative delta|:")
+    for i in top:
+        cd = float(cumulative_delta[i])
+        if abs(cd) < 1e-4:
+            continue
+        owner = _qpos_owner(env, int(i))
+        print(f"  qpos[{i:3d}]  cumΔ={cd:+.4f}   owner={owner}")
+
+    if float(np.max(np.abs(cumulative_delta))) < 1e-3:
+        print("[diag] VERDICT: nothing moved. The gripper controller is inert. "
+              "Bypass it via `env.robots[0].set_gripper_joint_positions(...)`.")
+    else:
+        # Show which joints moved most vs our assumed QPOS_INDICES_RIGHT_HAND
+        assumed_moved = float(np.max(np.abs(cumulative_delta[QPOS_INDICES_RIGHT_HAND])))
+        print(f"[diag] max |cumΔ| within QPOS_INDICES_RIGHT_HAND = {assumed_moved:.4f}")
+        if assumed_moved < 1e-3:
+            print("[diag] VERDICT: some joints moved but NOT the ones we're reading. "
+                  "QPOS_INDICES_RIGHT_HAND is stale. Update it based on the "
+                  "'top 20 qpos' list above (or look up by joint name).")
+        else:
+            print("[diag] VERDICT: gripper joints ARE moving in the region we expect. "
+                  "The problem is elsewhere (maybe too weak / needs bigger r_trig, "
+                  "or the finger reversal in build_env_action is off).")
+
+
+def _qpos_owner(env, addr):
+    """Reverse-lookup which joint owns qpos slot `addr`. Returns the joint
+    name (or 'name[k]' for k-th slot of a multi-DOF joint)."""
+    model = env.sim.model
+    for jid in range(model.njnt):
+        name = model.joint_id2name(jid) or ""
+        try:
+            a = model.get_joint_qpos_addr(name)
+        except Exception:
+            continue
+        if isinstance(a, int) and a == addr:
+            return name
+        if isinstance(a, tuple) and a[0] <= addr < a[1]:
+            return f"{name}[{addr - a[0]}]"
+    return "?"
+
+
 
 def run_replay(env, args, action_traj_18):
     """Replay a recorded action trajectory step by step. For each row in
@@ -513,11 +753,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="introspect",
                    choices=("introspect", "drive-state", "drive-action",
-                            "replay-trajectory"),
-                   help="introspect: just dump env; "
+                            "replay-trajectory", "gripper-probe"),
+                   help="introspect: just dump env + joint inventory; "
                         "drive-state: HOLD dataset state[step] as the action for --steps; "
                         "drive-action: HOLD dataset action[step] for --steps; "
-                        "replay-trajectory: FOLLOW dataset action[step:step+steps].")
+                        "replay-trajectory: FOLLOW dataset action[step:step+steps]; "
+                        "gripper-probe: hold arms + blast a full-close gripper command "
+                        "for --steps steps, print the per-step qpos delta so we can "
+                        "see which joints actually respond (or don't).")
     p.add_argument("--env",    default="Lift")
     p.add_argument("--robot",  default="GR1ArmsOnly")
     p.add_argument("--camera", default="frontview")
@@ -554,8 +797,17 @@ def main():
     print(f"[diag] reset right_arm = {np.round(ra, 3).tolist()}")
     print(f"[diag] reset left_arm  = {np.round(la, 3).tolist()}")
 
+    # Joint inventory always runs after reset — this is the diagnostic we
+    # really need for the gripper problem. Cheap; adds ~1s to any invocation.
+    dump_joint_inventory(env)
+
     if args.mode == "introspect":
-        print("\n[diag] introspect mode — not stepping. Pass --mode drive-state or drive-action.")
+        print("\n[diag] introspect mode — not stepping. Pass --mode drive-state, drive-action, or gripper-probe.")
+        env.close()
+        return
+
+    if args.mode == "gripper-probe":
+        run_gripper_probe(env, args)
         env.close()
         return
 
