@@ -459,13 +459,15 @@ def build_env_action(env, rarm, larm, r_trig=0.0):
     rh_dim, lh_dim = _gripper_slot_sizes(env)
 
     if rh_dim == 6:
-        # Custom masterthesis dex3 controller — per-finger interpolation
-        # between HAND_OPEN / HAND_CLOSED, then delta-vs-absolute conversion
-        # depending on what the gripper controller actually expects.
-        target_rh = _gripper_targets_from_r_trig(r_trig_clipped)
-        target_lh = HAND_OPEN.copy()   # left always open
-        rh = _gripper_action_from_targets(env, "right", target_rh)
-        lh = _gripper_action_from_targets(env, "left",  target_lh)
+        # Custom masterthesis dex3 config (FourierRightHand / FourierLeftHand
+        # in robosuite 1.5+). Its JointPositionController wrapper only ever
+        # moves the fingers ~0.02 rad no matter what delta we send — see the
+        # `gripper-probe` verdict. So we drive the fingers via a direct qpos
+        # write in the runner (`apply_gripper_qpos_bypass(env, r_trig)`
+        # called before env.step) and send ZEROS in the action-vector gripper
+        # slots so the controller doesn't fight us.
+        rh = np.zeros(rh_dim, dtype=np.float32)
+        lh = np.zeros(lh_dim, dtype=np.float32)
     else:
         # Default GR1 (5-slot) gripper — broadcast r_trig as before.
         rh = np.full(rh_dim, r_trig_clipped, dtype=np.float32)
@@ -635,6 +637,25 @@ def _expand_6_to_11(hand6):
     return action_fingers[HAND_6_TO_11_INDICES].astype(np.float32)
 
 
+def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
+    """Runner-facing wrapper: compute per-finger target from r_trig, expand
+    to 11 joints, write directly to sim.data.qpos, zero qvel there. Should
+    be called BEFORE env.step in run_drive / run_replay when the env has
+    the custom 6-slot dex3 gripper (rh_dim == 6). Only enabled when
+    `_gripper_slot_sizes(env) == (6, 6)`; a no-op otherwise so the default
+    GR1 controller path stays untouched.
+    """
+    try:
+        rh_dim, lh_dim = _gripper_slot_sizes(env)
+    except ValueError:
+        return
+    if rh_dim != 6:
+        return
+    target_rh6 = HAND_OPEN + float(np.clip(r_trig, 0.0, 1.0)) * (HAND_CLOSED - HAND_OPEN)
+    target_lh6 = HAND_OPEN + float(np.clip(left_r_trig, 0.0, 1.0)) * (HAND_CLOSED - HAND_OPEN)
+    _write_gripper_qpos(env, target_rh6, target_lh6)
+
+
 def _write_gripper_qpos(env, target_rh6, target_lh6):
     """Directly write the 11 finger qpos slots for both hands and zero their
     qvel. Bypasses the FourierRightHand/FourierLeftHand controller entirely
@@ -778,6 +799,9 @@ def run_replay(env, args, action_traj_18):
             print(f"[diag] target larm     : {np.round(larm, 3).tolist()}")
             print(f"[diag] r_trig          : {r_trig:+.3f}")
             print(f"[diag] env_action (26-D): {np.round(env_action, 3).tolist()}")
+        # Bypass FourierRightHand controller by writing target finger qpos
+        # directly. No-op for the default 5-slot gripper.
+        apply_gripper_qpos_bypass(env, r_trig)
         obs, _, done, _ = env.step(env_action)
         if t % log_every == 0 or t == len(action_traj_18) - 1:
             ra = arm_qpos(env, RIGHT_ARM_JOINTS)
@@ -823,6 +847,8 @@ def run_drive(env, args, target_rarm, target_larm, r_trig, label):
     log_every = max(1, args.steps // 10)
     err_history = []
     for t in range(args.steps):
+        # Direct-qpos bypass for the custom dex3 gripper. No-op for default GR1.
+        apply_gripper_qpos_bypass(env, r_trig)
         obs, _, done, _ = env.step(env_action)
         ra = arm_qpos(env, RIGHT_ARM_JOINTS)
         la = arm_qpos(env, LEFT_ARM_JOINTS)
