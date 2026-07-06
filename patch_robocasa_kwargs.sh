@@ -61,21 +61,24 @@ import sys
 path = sys.argv[1]
 src = open(path).read()
 
-patch_body = """\
-    # ── PATCHED (version drift band-aid) ───────────────────────────────
-    # robocasa was written against a newer robosuite that accepts extra
-    # kwargs (seed, translucent_robot, ...). robosuite@v1.5.1 doesn't.
-    # Filter env_kwargs to whatever the target env class actually accepts.
-    import inspect as _insp
-    from robosuite.environments.base import REGISTERED_ENVS as _REG
-    _en = env_kwargs.get("env_name")
-    if _en in _REG:
-        _cls = _REG[_en]
-        _accepted = set(_insp.signature(_cls.__init__).parameters.keys())
-        env_kwargs = {k: v for k, v in env_kwargs.items()
-                      if k in _accepted or k == "env_name"}
-    # ── END PATCH ──────────────────────────────────────────────────────
-"""
+# Patch body written WITHOUT any baseline indent — we apply the captured
+# indent below. (Prior version had 4-space baseline + captured indent →
+# doubled indent → IndentationError.)
+patch_lines = [
+    "# ── PATCHED (version drift band-aid) ───────────────────────────────",
+    "# robocasa was written against a newer robosuite that accepts extra",
+    "# kwargs (seed, translucent_robot, ...). robosuite@v1.5.1 doesn't.",
+    "# Filter env_kwargs to whatever the target env class actually accepts.",
+    "import inspect as _insp",
+    "from robosuite.environments.base import REGISTERED_ENVS as _REG",
+    "_en = env_kwargs.get(\"env_name\")",
+    "if _en in _REG:",
+    "    _cls = _REG[_en]",
+    "    _accepted = set(_insp.signature(_cls.__init__).parameters.keys())",
+    "    env_kwargs = {k: v for k, v in env_kwargs.items()",
+    "                  if k in _accepted or k == \"env_name\"}",
+    "# ── END PATCH ──────────────────────────────────────────────────────",
+]
 
 # Find `env = robosuite.make(**env_kwargs)`, preserving its leading whitespace.
 call_pat = re.compile(
@@ -91,11 +94,7 @@ if not m:
     )
 
 indent = m.group("indent")
-# Re-indent our patch body to match the call's indentation.
-indented_patch = "".join(
-    (indent + line if line.strip() else line)
-    for line in patch_body.splitlines(keepends=True)
-)
+indented_patch = "".join(indent + line + "\n" for line in patch_lines)
 
 new_src = src[: m.start()] + indented_patch + src[m.start():]
 open(path, "w").write(new_src)
