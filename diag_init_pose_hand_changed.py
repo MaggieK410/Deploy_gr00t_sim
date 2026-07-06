@@ -652,6 +652,125 @@ def _expand_6_to_11(hand6):
     return action_fingers[HAND_6_TO_11_INDICES].astype(np.float32)
 
 
+# Robosuite gripper actuator names, in the order they're listed in
+# env.robots[0].gripper[side].actuators. THIS ORDER IS THE REVERSE of the
+# joint order (pinky-intermediate first, thumb-proximal-yaw last). Note the
+# gripper prefix "gripper0_right_" / "gripper0_left_" is added at runtime.
+_R_ACTUATORS = [
+    "R_pinky_intermediate_joint_drive", "R_pinky_proximal_joint_drive",
+    "R_ring_intermediate_joint_drive",  "R_ring_proximal_joint_drive",
+    "R_middle_intermediate_joint_drive","R_middle_proximal_joint_drive",
+    "R_index_intermediate_joint_drive", "R_index_proximal_joint_drive",
+    "R_thumb_distal_joint_drive",       "R_thumb_proximal_pitch_joint_drive",
+    "R_thumb_proximal_yaw_joint_drive",
+]
+_L_ACTUATORS = [n.replace("R_", "L_") for n in _R_ACTUATORS]
+
+
+def _gripper_actuator_ids(env, side):
+    """Return the 11 mujoco actuator ids for the given side, in the order
+    they'll be commanded by our target_11 (which is in JOINT order — i.e.
+    thumb_yaw first, pinky_intermediate last)."""
+    model = env.sim.model
+    prefix = f"gripper0_{side}_"
+    # target_11 is in joint order [7..17], which corresponds to the actuator
+    # list in REVERSE (actuators are pinky-first, thumb-last).
+    names_in_joint_order = list(reversed(_R_ACTUATORS if side == "right" else _L_ACTUATORS))
+    ids = []
+    for name in names_in_joint_order:
+        aid = model.actuator_name2id(prefix + name)
+        ids.append(aid)
+    return ids
+
+
+def _write_gripper_ctrl(env, target_rh6, target_lh6):
+    """Write the per-actuator ctrl signals for both dex3 hands so the
+    position-servo actuators drive the fingers toward `target_*` while the
+    physics engine still enforces contact constraints (fingers stop at
+    cube surface instead of teleporting through it).
+    """
+    ctrl = env.sim.data.ctrl
+    target_rh11 = _expand_6_to_11(target_rh6)
+    target_lh11 = _expand_6_to_11(target_lh6)
+
+    right_ids = _gripper_actuator_ids(env, "right")
+    left_ids  = _gripper_actuator_ids(env, "left")
+    for aid, val in zip(right_ids, target_rh11):
+        ctrl[aid] = float(val)
+    for aid, val in zip(left_ids, target_lh11):
+        ctrl[aid] = float(val)
+
+
+def apply_gripper_ctrl_bypass(env, r_trig, left_r_trig=0.0,
+                              hand_open=None, hand_closed=None):
+    """Sibling to apply_gripper_qpos_bypass but writes actuator ctrl (mujoco
+    position servos) instead of qpos. Respects contact physics — fingers
+    stop at the cube surface instead of clipping through it. Optional
+    hand_open/hand_closed override the module-level HAND_OPEN/HAND_CLOSED
+    constants (use dataset-derived values for a much better lerp)."""
+    try:
+        rh_dim, _ = _gripper_slot_sizes(env)
+    except ValueError:
+        return
+    if rh_dim != 6:
+        return
+    hopen  = HAND_OPEN   if hand_open   is None else np.asarray(hand_open,   dtype=np.float32)
+    hclose = HAND_CLOSED if hand_closed is None else np.asarray(hand_closed, dtype=np.float32)
+    r  = float(np.clip(r_trig,      0.0, 1.0))
+    lr = float(np.clip(left_r_trig, 0.0, 1.0))
+    target_rh6 = hopen + r  * (hclose - hopen)
+    target_lh6 = hopen + lr * (hclose - hopen)
+    _write_gripper_ctrl(env, target_rh6, target_lh6)
+
+
+def compute_dataset_hand_endpoints(dataset_path, episode=0, low_thr=0.05,
+                                    high_thr=None, n_high_frames=8):
+    """Sweep the given episode's parquet, compute:
+      HAND_OPEN_emp   = mean state.right_hand[1:7] over frames with r_trig < low_thr
+      HAND_CLOSED_emp = mean state.right_hand[1:7] over the top-n_high_frames
+                        highest-r_trig frames, then PROJECTED to r_trig=1
+                        via linear extrapolation:
+                          scale = 1.0 / mean_r_trig_of_top_frames
+                          CLOSED_emp = OPEN_emp + scale * (mean_top_hand - OPEN_emp)
+
+    Returns (HAND_OPEN_emp, HAND_CLOSED_emp) as np.float32 6-vecs.
+    Prints a summary. Fully data-driven — no master-thesis assumption.
+    """
+    p = Path(dataset_path)
+    if p.is_dir():
+        p = p / "data" / "chunk-000" / f"episode_{episode:06d}.parquet"
+    df = pd.read_parquet(p)
+    states = np.stack([np.asarray(x, dtype=np.float32)
+                       for x in df["observation.state"].values])
+    actions = np.stack([np.asarray(x, dtype=np.float32)
+                       for x in df["action"].values])
+    right_hand_6 = states[:, 22:28]              # per-finger
+    r_trig_arr   = actions[:, 17]                # (T,)
+
+    open_mask = r_trig_arr < low_thr
+    if not open_mask.any():
+        print(f"[diag] WARNING: no frames with r_trig < {low_thr}; using first frame")
+        hopen = right_hand_6[0]
+    else:
+        hopen = right_hand_6[open_mask].mean(axis=0)
+
+    # Take the n_high_frames frames with highest r_trig
+    top_idx = np.argsort(-r_trig_arr)[:n_high_frames]
+    top_r_trig = float(r_trig_arr[top_idx].mean())
+    top_hand   = right_hand_6[top_idx].mean(axis=0)
+    if top_r_trig > 1e-3:
+        scale = 1.0 / top_r_trig
+        hclose = hopen + scale * (top_hand - hopen)
+    else:
+        hclose = HAND_CLOSED  # fallback
+
+    print(f"[diag] dataset-derived HAND_OPEN   = {np.round(hopen, 3).tolist()} "
+          f"(from {int(open_mask.sum())} low-r_trig frames)")
+    print(f"[diag] dataset-derived HAND_CLOSED = {np.round(hclose, 3).tolist()} "
+          f"(extrapolated from top {n_high_frames} frames, mean r_trig={top_r_trig:.3f})")
+    return hopen.astype(np.float32), hclose.astype(np.float32)
+
+
 def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
     """Runner-facing wrapper: compute per-finger target from r_trig, expand
     to 11 joints, write directly to sim.data.qpos, zero qvel there. Should
@@ -873,6 +992,70 @@ def run_replay(env, args, action_traj_18):
         print(f"[diag] video saved → {args.output}")
 
 
+def run_replay_ctrl(env, args, action_traj_18):
+    """Replay a trajectory using the CONTROLLER PATH (writes to
+    env.sim.data.ctrl instead of teleporting qpos). Reverse-engineers per-
+    finger targets from r_trig via a dataset-derived HAND_OPEN / HAND_CLOSED
+    pair (computed from args.dataset at startup). Contact physics respected:
+    fingers close until they hit the cube, then stop.
+
+    This is the deploy-realistic path — the VLA outputs r_trig, we lerp
+    empirically-fit finger targets, and mujoco actuators do the rest.
+    """
+    # 1. Compute the dataset-derived open/closed endpoints for the r_trig
+    #    lerp. This replaces the master-thesis HAND_OPEN/HAND_CLOSED which
+    #    are wrong for this dataset.
+    hopen, hclose = compute_dataset_hand_endpoints(
+        args.dataset, episode=args.episode,
+    )
+
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    print(f"\n[diag] === replay-trajectory-ctrl: {len(action_traj_18)} steps ===")
+    print("[diag] Path: sim.data.ctrl writes (contact-respecting). Endpoints "
+          "from dataset.")
+    log_every = max(1, len(action_traj_18) // 12)
+
+    for t, a18 in enumerate(action_traj_18):
+        rarm, larm, r_trig = action18_to_arms(a18)
+        env_action = build_env_action(env, rarm, larm, r_trig)
+
+        # Write actuator ctrl BEFORE env.step. env.step will run mujoco
+        # sub-steps that use these ctrl signals as position-servo targets.
+        apply_gripper_ctrl_bypass(env, r_trig, hand_open=hopen, hand_closed=hclose)
+
+        obs, _, done, _ = env.step(env_action)
+
+        if t == 0 or t % log_every == 0 or t == len(action_traj_18) - 1:
+            ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+            rh_qpos = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                dtype=np.float32)
+            err_r = float(np.max(np.abs(ra - rarm)))
+            print(f"[diag] t={t:3d}  R_elbow={ra[3]:+.3f} (target {rarm[3]:+.3f})  "
+                  f"max|err|_R={err_r:.3f}  r_trig={r_trig:+.3f}")
+            print(f"[diag]        rh_qpos = {np.round(rh_qpos, 3).tolist()}")
+
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            print(f"[diag] env signaled done at t={t}")
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+
 def run_replay_state_fingers(env, args, action_traj_18, state_traj_28):
     """Trajectory replay that uses `state.right_hand[1:7]` (per-finger positions
     recorded in the dataset) as the direct qpos write target, instead of the
@@ -1012,6 +1195,7 @@ def main():
     p.add_argument("--mode", default="introspect",
                    choices=("introspect", "drive-state", "drive-action",
                             "replay-trajectory", "replay-state-fingers",
+                            "replay-trajectory-ctrl",
                             "gripper-probe", "gripper-force-qpos"),
                    help="introspect: just dump env + joint inventory; "
                         "drive-state: HOLD dataset state[step] as the action for --steps; "
@@ -1092,6 +1276,9 @@ def main():
         traj    = load_dataset_action_trajectory(args)
         s_traj  = load_dataset_state_trajectory(args)
         run_replay_state_fingers(env, args, traj, s_traj)
+    elif args.mode == "replay-trajectory-ctrl":
+        traj = load_dataset_action_trajectory(args)
+        run_replay_ctrl(env, args, traj)
     else:
         s28, a18 = load_dataset_state_and_action(args)
         if args.mode == "drive-state":
