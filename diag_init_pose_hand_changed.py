@@ -347,6 +347,21 @@ def load_dataset_action_trajectory(args):
     return actions
 
 
+def load_dataset_state_trajectory(args):
+    """Return observation.state[step:step+args.steps] as (T, 28). Used by
+    the state-fingers replay to grab per-finger targets straight from the
+    recorded dataset (bypassing the lossy r_trig → per-finger reconstruction)."""
+    p = Path(args.dataset)
+    if p.is_dir():
+        p = p / "data" / "chunk-000" / f"episode_{args.episode:06d}.parquet"
+    df = pd.read_parquet(p)
+    states = []
+    end = min(args.step + args.steps, len(df))
+    for i in range(args.step, end):
+        states.append(np.asarray(df["observation.state"].iloc[i], dtype=np.float32))
+    return np.stack(states, axis=0)
+
+
 def state28_to_arms(s28):
     return (
         s28[14:21].astype(np.float32),   # right_arm  (7)
@@ -656,6 +671,22 @@ def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
     _write_gripper_qpos(env, target_rh6, target_lh6)
 
 
+def apply_gripper_qpos_exact(env, target_rh6, target_lh6):
+    """Same as apply_gripper_qpos_bypass but with the caller providing an
+    already-computed 6-DOF per-finger target (bypassing the r_trig -> lerp
+    reconstruction). Used by the state-fingers replay mode to write the
+    per-frame recorded finger state directly."""
+    try:
+        rh_dim, _ = _gripper_slot_sizes(env)
+    except ValueError:
+        return
+    if rh_dim != 6:
+        return
+    _write_gripper_qpos(env,
+                        np.asarray(target_rh6, dtype=np.float32),
+                        np.asarray(target_lh6, dtype=np.float32))
+
+
 def _write_gripper_qpos(env, target_rh6, target_lh6):
     """Set the 11 dex3 finger positions per hand via the robosuite-blessed
     `robot.set_gripper_joint_positions(...)` API — same call the master-
@@ -842,6 +873,75 @@ def run_replay(env, args, action_traj_18):
         print(f"[diag] video saved → {args.output}")
 
 
+def run_replay_state_fingers(env, args, action_traj_18, state_traj_28):
+    """Trajectory replay that uses `state.right_hand[1:7]` (per-finger positions
+    recorded in the dataset) as the direct qpos write target, instead of the
+    r_trig -> lerp reconstruction. If this produces a valid grasp but the
+    normal replay does not, we've proven:
+      (a) the direct qpos write path IS correct
+      (b) the controller isn't hopelessly broken
+      (c) the failure mode is our r_trig -> per-finger reconstruction (using
+          the wrong HAND_CLOSED constant).
+    """
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    T = min(len(action_traj_18), len(state_traj_28))
+    print(f"\n[diag] === replay-state-fingers: {T} steps ===")
+    print("[diag] Using state.right_hand[1:7] / state.left_hand[1:7] as the "
+          "direct qpos target each step (bypasses r_trig -> per-finger lerp).")
+    log_every = max(1, T // 12)
+
+    for t in range(T):
+        a18 = action_traj_18[t]
+        s28 = state_traj_28[t]
+        rarm, larm, r_trig = action18_to_arms(a18)
+        env_action = build_env_action(env, rarm, larm, r_trig)
+
+        # Per-finger targets straight from the dataset. Layout in state_28
+        # (from modality.json):
+        #   left_hand  [7:14]  = [grip, f0, f1, f2, f3, f4, f5]
+        #   right_hand [21:28] = same
+        target_lh6 = s28[8:14].astype(np.float32)
+        target_rh6 = s28[22:28].astype(np.float32)
+        apply_gripper_qpos_exact(env, target_rh6, target_lh6)
+
+        rh_after_write = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                   dtype=np.float32).copy()
+        obs, _, done, _ = env.step(env_action)
+        rh_after_step = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                  dtype=np.float32)
+
+        if t == 0 or t % log_every == 0 or t == T - 1:
+            ra = arm_qpos(env, RIGHT_ARM_JOINTS)
+            err_r = float(np.max(np.abs(ra - rarm)))
+            drift = float(np.max(np.abs(rh_after_step - rh_after_write)))
+            print(f"[diag] t={t:3d}  R_elbow={ra[3]:+.3f} (target {rarm[3]:+.3f})  "
+                  f"max|err|_R={err_r:.3f}  r_trig={r_trig:+.3f}  "
+                  f"target_rh6={np.round(target_rh6, 3).tolist()}")
+            print(f"[diag]        rh_after_step  = {np.round(rh_after_step, 3).tolist()}")
+            print(f"[diag]        gripper drift  = {drift:.4f}")
+
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            print(f"[diag] env signaled done at t={t}")
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+
 def run_drive(env, args, target_rarm, target_larm, r_trig, label):
     """Send the same action repeatedly and log measured-joint convergence."""
     writer = None
@@ -911,12 +1011,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="introspect",
                    choices=("introspect", "drive-state", "drive-action",
-                            "replay-trajectory", "gripper-probe",
-                            "gripper-force-qpos"),
+                            "replay-trajectory", "replay-state-fingers",
+                            "gripper-probe", "gripper-force-qpos"),
                    help="introspect: just dump env + joint inventory; "
                         "drive-state: HOLD dataset state[step] as the action for --steps; "
                         "drive-action: HOLD dataset action[step] for --steps; "
                         "replay-trajectory: FOLLOW dataset action[step:step+steps]; "
+                        "replay-state-fingers: same as replay-trajectory but the "
+                        "gripper target each step is dataset state.right_hand[1:7] "
+                        "directly (bypasses r_trig -> per-finger reconstruction); "
                         "gripper-probe: hold arms + blast a full-close gripper command "
                         "for --steps steps, print the per-step qpos delta so we can "
                         "see which joints actually respond (or don't); "
@@ -985,6 +1088,10 @@ def main():
     if args.mode == "replay-trajectory":
         traj = load_dataset_action_trajectory(args)
         run_replay(env, args, traj)
+    elif args.mode == "replay-state-fingers":
+        traj    = load_dataset_action_trajectory(args)
+        s_traj  = load_dataset_state_trajectory(args)
+        run_replay_state_fingers(env, args, traj, s_traj)
     else:
         s28, a18 = load_dataset_state_and_action(args)
         if args.mode == "drive-state":
