@@ -1,0 +1,20 @@
+
+*** These modified files were found in JOE when it aborted on Mon Jul  6 11:02:52 2026
+*** JOE was aborted because the terminal closed
+
+*** File '(Unnamed)'
+/home/mkulcsar/Deploy_gr00t_sim/.git/MERGE_MSG
+
+*** File '/home/mkulcsar/Deploy_gr00t_sim/.git/MERGE_MSG'
+Merge branch 'main' of https://github.com/MaggieK410/Deploy_gr00t_sim
+# Please enter a commit message to explain why this merge is necessary,
+# especially if it merges an updated upstream into a topic branch.
+#
+# Lines starting with '#' will be ignored, and an empty message aborts
+# the commit.
+Upload Readm
+*** File '* Startup Log *'
+Processing '/etc/joe/editorrc'...
+Processing '/etc/joe/ftyperc'...
+Finished processing /etc/joe/ftyperc
+Finished processing /etc/joe/editorrc
