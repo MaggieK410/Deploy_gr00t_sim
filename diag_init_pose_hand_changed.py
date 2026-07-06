@@ -620,6 +620,120 @@ def run_gripper_probe(env, args):
                   "or the finger reversal in build_env_action is off).")
 
 
+# Mapping from the 6-DOF finger vector (HAND_OPEN/HAND_CLOSED order) to the
+# 11-DOF joint layout that qpos[QPOS_INDICES_RIGHT_HAND] expects. Verbatim
+# from collect_data_with_groot.py:413.
+HAND_6_TO_11_INDICES = np.array([1, 0, 0, 2, 2, 3, 3, 4, 4, 5, 5], dtype=np.int64)
+
+
+def _expand_6_to_11(hand6):
+    """Master-thesis 6-to-11 expansion (collect_data_with_groot.py:412-414):
+        action_fingers = hand6[::-1]                 # reverse
+        new_hand = action_fingers[HAND_6_TO_11_INDICES]
+    """
+    action_fingers = np.asarray(hand6, dtype=np.float32)[::-1]
+    return action_fingers[HAND_6_TO_11_INDICES].astype(np.float32)
+
+
+def _write_gripper_qpos(env, target_rh6, target_lh6):
+    """Directly write the 11 finger qpos slots for both hands and zero their
+    qvel. Bypasses the FourierRightHand/FourierLeftHand controller entirely
+    (which seems to only be capable of moving joints by ~0.02 rad regardless
+    of input).
+    """
+    target_rh11 = _expand_6_to_11(target_rh6)
+    target_lh11 = _expand_6_to_11(target_lh6)
+    env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND] = target_rh11
+    env.sim.data.qpos[QPOS_INDICES_LEFT_HAND]  = target_lh11
+    # Zero the velocities on those joints so the PD sees no velocity error.
+    # In mujoco, qvel indices for hinge joints line up 1:1 with qpos indices.
+    env.sim.data.qvel[QPOS_INDICES_RIGHT_HAND] = 0.0
+    env.sim.data.qvel[QPOS_INDICES_LEFT_HAND]  = 0.0
+    env.sim.forward()
+
+
+def run_gripper_force_qpos(env, args):
+    """Bypass test: write the target finger qpos DIRECTLY (via sim.data.qpos)
+    before each env.step, with zero gripper action in the env action vector.
+    If the fingers visibly close and stay closed → direct-write path works,
+    we can integrate it into build_env_action. If they snap back to open
+    each step → the PID is fighting us and we need a stronger bypass.
+    """
+    n_steps = args.steps
+    print(f"\n[diag] === gripper-force-qpos: {n_steps} steps ===")
+
+    hold_rarm = arm_qpos(env, RIGHT_ARM_JOINTS)
+    hold_larm = arm_qpos(env, LEFT_ARM_JOINTS)
+
+    # Target: fully closed right hand, open left hand.
+    target_rh6 = HAND_CLOSED.copy()
+    target_lh6 = HAND_OPEN.copy()
+    print(f"[diag] target right hand (6-DOF): {target_rh6.tolist()}")
+    print(f"[diag] expanded to 11 joints:     {_expand_6_to_11(target_rh6).tolist()}")
+
+    writer = None
+    if args.output:
+        fr0 = get_frame(env, args)
+        if fr0 is not None:
+            h, w = fr0.shape[:2]
+            writer = cv2.VideoWriter(
+                args.output, cv2.VideoWriter_fourcc(*"mp4v"),
+                float(args.fps), (w, h),
+            )
+
+    log_every = max(1, n_steps // 10)
+    for t in range(n_steps):
+        # 1. Write target gripper qpos directly.
+        _write_gripper_qpos(env, target_rh6, target_lh6)
+        rh_after_write = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                   dtype=np.float32).copy()
+
+        # 2. Build env action with zero gripper action (send OPEN so delta=0
+        #    after our qpos write). Arms hold their reset pose.
+        env_action = build_env_action(env, hold_rarm, hold_larm, r_trig=0.0)
+        # Force the gripper slots to zero regardless of what build_env_action did.
+        # In the custom controller_config.json layout, the last 12 slots are
+        # right_gripper(6) then left_gripper(6).
+        env_action = env_action.copy()
+        env_action[-12:] = 0.0
+
+        obs, _, done, _ = env.step(env_action)
+        rh_after_step = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                                  dtype=np.float32)
+        if t == 0 or (t + 1) % log_every == 0 or t == n_steps - 1:
+            drift = rh_after_step - rh_after_write
+            print(f"[diag] t={t:3d}  wrote right qpos = "
+                  f"{np.round(rh_after_write, 3).tolist()}")
+            print(f"[diag]        after env.step   = "
+                  f"{np.round(rh_after_step, 3).tolist()}")
+            print(f"[diag]        drift            = "
+                  f"{np.round(drift, 4).tolist()}")
+
+        if writer is not None:
+            fr = get_frame(env, args)
+            if fr is not None:
+                writer.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        if done and not args.ignore_done:
+            break
+
+    if writer is not None:
+        writer.release()
+        print(f"[diag] video saved → {args.output}")
+
+    final_rh = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
+                        dtype=np.float32)
+    diff_from_target = final_rh - _expand_6_to_11(target_rh6)
+    print(f"\n[diag] --- gripper-force-qpos summary ---")
+    print(f"[diag] final right qpos           = {np.round(final_rh, 3).tolist()}")
+    print(f"[diag] final |qpos - target_11|   = "
+          f"{float(np.max(np.abs(diff_from_target))):.4f}")
+    if float(np.max(np.abs(diff_from_target))) < 0.05:
+        print("[diag] VERDICT: direct qpos write HOLDS. Bake this into build_env_action.")
+    else:
+        print("[diag] VERDICT: PID undoes the write. Need `robot.set_gripper_joint_positions` "
+              "or set sim.data.ctrl directly.")
+
+
 def _qpos_owner(env, addr):
     """Reverse-lookup which joint owns qpos slot `addr`. Returns the joint
     name (or 'name[k]' for k-th slot of a multi-DOF joint)."""
@@ -753,14 +867,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="introspect",
                    choices=("introspect", "drive-state", "drive-action",
-                            "replay-trajectory", "gripper-probe"),
+                            "replay-trajectory", "gripper-probe",
+                            "gripper-force-qpos"),
                    help="introspect: just dump env + joint inventory; "
                         "drive-state: HOLD dataset state[step] as the action for --steps; "
                         "drive-action: HOLD dataset action[step] for --steps; "
                         "replay-trajectory: FOLLOW dataset action[step:step+steps]; "
                         "gripper-probe: hold arms + blast a full-close gripper command "
                         "for --steps steps, print the per-step qpos delta so we can "
-                        "see which joints actually respond (or don't).")
+                        "see which joints actually respond (or don't); "
+                        "gripper-force-qpos: bypass gripper controller by writing "
+                        "target finger qpos directly to sim.data.qpos each step. "
+                        "Tests whether the direct-write path holds.")
     p.add_argument("--env",    default="Lift")
     p.add_argument("--robot",  default="GR1ArmsOnly")
     p.add_argument("--camera", default="frontview")
@@ -808,6 +926,11 @@ def main():
 
     if args.mode == "gripper-probe":
         run_gripper_probe(env, args)
+        env.close()
+        return
+
+    if args.mode == "gripper-force-qpos":
+        run_gripper_force_qpos(env, args)
         env.close()
         return
 
