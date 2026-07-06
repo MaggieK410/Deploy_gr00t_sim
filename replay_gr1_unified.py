@@ -194,25 +194,33 @@ def reconstruct_hand_from_r_trig(r_trig: np.ndarray, canonical: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────
 def build_env(env_name: str, video_dir: str, max_episode_steps: int,
               n_action_steps: int):
-    """Wrap gym.make(env_name) with VideoRecordingWrapper + MultiStepWrapper
-    exactly like simulation_service.py does. This keeps the action-dict
-    interface (T=n_action_steps chunks) consistent with training-time."""
+    """Wrap the gym-registered env with N1.6 Isaac-GR00T's VideoRecordingWrapper
+    + MultiStepWrapper via `gr00t.eval.rollout_policy.create_eval_env`. This
+    keeps the action-dict interface (T=n_action_steps chunks) consistent with
+    training-time collection.
+    """
     import gymnasium as gym
-    from gr00t.eval.simulation import (
-        SimulationConfig, VideoConfig, MultiStepConfig, _create_single_env,
+    from gr00t.eval.rollout_policy import (
+        WrapperConfigs, VideoConfig, MultiStepConfig, create_eval_env,
     )
 
-    config = SimulationConfig(
-        env_name=env_name,
-        n_episodes=1,
-        n_envs=1,
-        video=VideoConfig(video_dir=video_dir),
+    wrapper_configs = WrapperConfigs(
+        video=VideoConfig(
+            video_dir=video_dir,
+            max_episode_steps=max_episode_steps,
+        ),
         multistep=MultiStepConfig(
             n_action_steps=n_action_steps,
             max_episode_steps=max_episode_steps,
         ),
     )
-    env_fn = partial(_create_single_env, config=config, idx=0)
+    env_fn = partial(
+        create_eval_env,
+        env_name=env_name,
+        env_idx=0,
+        total_n_envs=1,
+        wrapper_configs=wrapper_configs,
+    )
     env = gym.vector.SyncVectorEnv([env_fn])
     return env
 
