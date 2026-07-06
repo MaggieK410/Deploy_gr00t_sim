@@ -198,7 +198,7 @@ def build_env(env_name: str, video_dir: str, max_episode_steps: int,
     exactly like simulation_service.py does. This keeps the action-dict
     interface (T=n_action_steps chunks) consistent with training-time."""
     import gymnasium as gym
-    from gr00t.eval.simulation import (
+    from gr00t.eval.sim import (
         SimulationConfig, VideoConfig, MultiStepConfig, _create_single_env,
     )
 
