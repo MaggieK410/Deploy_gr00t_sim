@@ -192,6 +192,26 @@ def reconstruct_hand_from_r_trig(r_trig: np.ndarray, canonical: np.ndarray,
 # ─────────────────────────────────────────────────────────────────────
 # Env construction — reuse gr00t.eval.simulation helpers
 # ─────────────────────────────────────────────────────────────────────
+def _patch_robosuite_make_strip_seed():
+    """robocasa-gr1-tabletop-tasks' gymnasium_basic.py:73 hardcodes
+    `seed=seed` into env_kwargs forwarded to robosuite.make(). But the
+    pinned robosuite@v1.5.1 `Lift.__init__` (and other older envs) don't
+    accept `seed` as a kwarg → TypeError. Fix: wrap robosuite.make so it
+    pops `seed` before delegating. Idempotent.
+    """
+    import robosuite
+    if getattr(robosuite.make, "_seed_stripped", False):
+        return
+    _orig = robosuite.make
+
+    def _patched(*args, **kwargs):
+        kwargs.pop("seed", None)
+        return _orig(*args, **kwargs)
+
+    _patched._seed_stripped = True
+    robosuite.make = _patched
+
+
 def build_env(env_name: str, video_dir: str, max_episode_steps: int,
               n_action_steps: int):
     """Wrap the gym-registered env with N1.6 Isaac-GR00T's VideoRecordingWrapper
@@ -199,6 +219,7 @@ def build_env(env_name: str, video_dir: str, max_episode_steps: int,
     keeps the action-dict interface (T=n_action_steps chunks) consistent with
     training-time collection.
     """
+    _patch_robosuite_make_strip_seed()
     import gymnasium as gym
     from gr00t.eval.rollout_policy import (
         WrapperConfigs, VideoConfig, MultiStepConfig, create_eval_env,
