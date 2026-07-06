@@ -771,13 +771,16 @@ def compute_dataset_hand_endpoints(dataset_path, episode=0, low_thr=0.05,
     return hopen.astype(np.float32), hclose.astype(np.float32)
 
 
-def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
-    """Runner-facing wrapper: compute per-finger target from r_trig, expand
-    to 11 joints, write directly to sim.data.qpos, zero qvel there. Should
-    be called BEFORE env.step in run_drive / run_replay when the env has
-    the custom 6-slot dex3 gripper (rh_dim == 6). Only enabled when
-    `_gripper_slot_sizes(env) == (6, 6)`; a no-op otherwise so the default
-    GR1 controller path stays untouched.
+def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0,
+                              hand_open=None, hand_closed=None):
+    """Runner-facing wrapper: compute per-finger target from r_trig via lerp
+    between `hand_open` and `hand_closed`, expand to 11 joints, write via
+    set_gripper_joint_positions (which updates the controller reference too).
+
+    When `hand_open` / `hand_closed` are None, falls back to the module-
+    level HAND_OPEN / HAND_CLOSED constants (master-thesis values, which
+    are usually wrong for a specific dataset). Preferred: pass empirically
+    derived endpoints from `compute_dataset_hand_endpoints(args.dataset)`.
     """
     try:
         rh_dim, lh_dim = _gripper_slot_sizes(env)
@@ -785,8 +788,10 @@ def apply_gripper_qpos_bypass(env, r_trig, left_r_trig=0.0):
         return
     if rh_dim != 6:
         return
-    target_rh6 = HAND_OPEN + float(np.clip(r_trig, 0.0, 1.0)) * (HAND_CLOSED - HAND_OPEN)
-    target_lh6 = HAND_OPEN + float(np.clip(left_r_trig, 0.0, 1.0)) * (HAND_CLOSED - HAND_OPEN)
+    hopen  = HAND_OPEN   if hand_open   is None else np.asarray(hand_open,   dtype=np.float32)
+    hclose = HAND_CLOSED if hand_closed is None else np.asarray(hand_closed, dtype=np.float32)
+    target_rh6 = hopen + float(np.clip(r_trig,      0.0, 1.0)) * (hclose - hopen)
+    target_lh6 = hopen + float(np.clip(left_r_trig, 0.0, 1.0)) * (hclose - hopen)
     _write_gripper_qpos(env, target_rh6, target_lh6)
 
 
@@ -934,7 +939,18 @@ def run_replay(env, args, action_traj_18):
     """Replay a recorded action trajectory step by step. For each row in
     `action_traj_18` we extract (rarm, larm, r_trig), build the 26-D env
     action, and step the env once. Saves video and prints per-step error
-    vs the expected next state (if dataset has next-state info)."""
+    vs the expected next state (if dataset has next-state info).
+
+    Reverse-engineers per-finger targets from r_trig via dataset-derived
+    HAND_OPEN / HAND_CLOSED (computed at startup from args.dataset), then
+    writes qpos directly. This is the deploy-realistic path — the VLA
+    outputs r_trig, we lerp finger targets from dataset endpoints, gripper
+    closes.
+    """
+    hopen, hclose = compute_dataset_hand_endpoints(
+        args.dataset, episode=args.episode,
+    )
+
     writer = None
     if args.output:
         fr0 = get_frame(env, args)
@@ -957,8 +973,10 @@ def run_replay(env, args, action_traj_18):
             print(f"[diag] r_trig          : {r_trig:+.3f}")
             print(f"[diag] env_action (26-D): {np.round(env_action, 3).tolist()}")
         # Bypass FourierRightHand controller by writing target finger qpos
-        # directly. No-op for the default 5-slot gripper.
-        apply_gripper_qpos_bypass(env, r_trig)
+        # directly, using DATASET-DERIVED endpoints for the r_trig lerp.
+        # No-op for the default 5-slot gripper.
+        apply_gripper_qpos_bypass(env, r_trig,
+                                  hand_open=hopen, hand_closed=hclose)
         rh_after_write = np.array(env.sim.data.qpos[QPOS_INDICES_RIGHT_HAND],
                                    dtype=np.float32).copy()
         obs, _, done, _ = env.step(env_action)
