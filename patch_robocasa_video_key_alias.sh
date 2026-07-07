@@ -31,15 +31,23 @@ set -euo pipefail
 
 PY="${ROBOCASA_PYTHON:-python3}"
 
-FILE=$($PY - <<'PY'
+# Some robocasa imports print WARNING / info lines to stdout during
+# import (e.g. "WARNING: mimicgen environments not imported ..."). We
+# tag the real path with a distinctive prefix, then grep it out.
+FILE=$($PY - <<'PY' 2>/dev/null | sed -n 's/^__PATCH_TARGET__=//p' | tail -n 1
 import importlib.util
 spec = importlib.util.find_spec("robocasa.utils.gym_utils.gymnasium_groot")
 if spec is None or spec.origin is None:
     raise SystemExit("robocasa.utils.gym_utils.gymnasium_groot not importable — "
                      "activate the correct venv first.")
-print(spec.origin)
+print(f"__PATCH_TARGET__={spec.origin}")
 PY
 )
+
+if [ -z "$FILE" ]; then
+    echo "ERROR: could not locate gymnasium_groot.py — is robocasa importable in this venv?"
+    exit 1
+fi
 
 echo "[patch] target: $FILE"
 
