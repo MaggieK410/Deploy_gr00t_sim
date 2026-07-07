@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # patch_robocasa_video_key_alias.sh
 # ------------------------------------------------------------------
-# Fixes the modality-key mismatch:
+# Aligns robocasa-gr1-tabletop-tasks' modality key naming with modern
+# GR00T checkpoints. The env at the pinned commit uses legacy names:
 #
-#   RuntimeError: Server error: Video key 'video.ego_view' must be in observation
+#   video.ego_view_pad_res256_freq20     (image)
+#   annotation.human.coarse_action       (prefixed with "unlocked_waist: ")
 #
-# Root cause: robocasa-gr1-tabletop-tasks (at the pinned commit) emits
-# the camera image under the LEGACY key `video.ego_view_pad_res256_freq20`
-# (see `robocasa/models/robots/__init__.py:221` and
-# `robocasa/utils/gym_utils/gymnasium_groot.py:31`). Modern GR00T
-# checkpoints — including ones trained via the current data pipeline —
-# expect the SHORT key `video.ego_view`.
+# Modern checkpoints (finetunes on datasets exported with the newer
+# pipeline) expect:
 #
-# Fix: patch `gymnasium_groot.py` to add `video.ego_view` as an ALIAS of
-# `video.ego_view_pad_res256_freq20`, both in the observation_space
-# declaration and in the obs dict returned by `get_groot_observation`.
-# Same underlying image; just an additional key.
+#   video.ego_view                       (short name)
+#   annotation.human.action.task_description   (raw text, no prefix)
+#
+# This patch adds ALIAS keys — the underlying image/text is unchanged,
+# just exposed under an additional name. Two independent modality
+# aliases in a single script:
+#
+#   [A] video.ego_view_pad_res256_freq20  -> video.ego_view
+#   [B] annotation.human.coarse_action    -> annotation.human.action.task_description
+#       (with "locked_waist: " / "unlocked_waist: " prefix stripped)
+#
+# Both are per-marker idempotent; you can re-run this script as many
+# times as you want and each alias only lands once.
 #
 # Usage
 # -----
@@ -25,7 +32,8 @@
 #   # Or point at a specific python that has robocasa installed
 #   ROBOCASA_PYTHON=/path/to/venv/bin/python bash patch_robocasa_video_key_alias.sh
 #
-# Idempotent (marker check). Reversible (.bak).
+# Reversible (.bak preserved on first run only, so it always reflects
+# the pristine pre-patch file).
 
 set -euo pipefail
 
@@ -51,28 +59,36 @@ fi
 
 echo "[patch] target: $FILE"
 
-if grep -q "PATCHED_VIDEO_EGO_VIEW_ALIAS" "$FILE"; then
-    echo "[patch] $FILE already patched — no-op."
-    grep -n "PATCHED_VIDEO_EGO_VIEW_ALIAS" "$FILE" | head -3
-    exit 0
+# Preserve the pristine .bak on FIRST patch run; don't clobber it on re-runs.
+if [ ! -f "$FILE.bak" ]; then
+    echo "[patch] backing up $FILE -> $FILE.bak"
+    cp "$FILE" "$FILE.bak"
+else
+    echo "[patch] $FILE.bak already exists — leaving it alone (represents pristine file)"
 fi
 
-echo "[patch] backing up $FILE -> $FILE.bak"
-cp "$FILE" "$FILE.bak"
-
 $PY - "$FILE" <<'PY'
-"""Two injections in `gymnasium_groot.py`:
+"""Four injections in `gymnasium_groot.py`, grouped into two independent
+markers so you can re-run this script and only unpatched sections land.
 
-(A) In `GrootRoboCasaEnv.__init__`, right after the `if mapped_name ==
-    "video.ego_view_pad_res256_freq20":` block that adds the co-train
-    key to observation_space, also add `video.ego_view` as another
-    alias to the same space.
+VIDEO alias (marker: PATCHED_VIDEO_EGO_VIEW_ALIAS):
+  A1: In `__init__`, after the `if mapped_name == "video.ego_view_pad_res256_freq20":`
+      block that adds the co-train key to observation_space, also declare
+      `video.ego_view` as a Box of the same shape.
+  A2: In `get_groot_observation`, after the corresponding block that
+      populates `video.ego_view_bg_crop_pad_res256_freq20`, copy the
+      processed image into `video.ego_view`.
 
-(B) In `get_groot_observation`, right after the corresponding block that
-    populates `video.ego_view_bg_crop_pad_res256_freq20`, also copy
-    the processed image into `video.ego_view`.
+LANGUAGE alias (marker: PATCHED_LANGUAGE_TASK_DESC_ALIAS):
+  B1: In `__init__`, right after the `elif isinstance(..., GR1ArmsAndWaist):`
+      block that adds `annotation.human.coarse_action` to observation_space,
+      also declare `annotation.human.action.task_description` as Text.
+  B2: In `get_groot_observation`, right after the corresponding elif
+      block that assigns `"unlocked_waist: {raw_obs['language']}"`, also
+      assign the RAW text (prefix stripped) to
+      `annotation.human.action.task_description`.
 
-Both insertions preserve the captured indent of the anchor line.
+Each injection is guarded by an in-body marker check so re-runs are safe.
 """
 import re
 import sys
@@ -80,83 +96,142 @@ import sys
 path = sys.argv[1]
 src = open(path).read()
 
-MARKER = "PATCHED_VIDEO_EGO_VIEW_ALIAS"
+VIDEO_MARKER = "PATCHED_VIDEO_EGO_VIEW_ALIAS"
+LANG_MARKER = "PATCHED_LANGUAGE_TASK_DESC_ALIAS"
 
-# Anchor 1 (in __init__): the block that adds bg_crop to observation_space.
-# We inject a second alias right after that closing block.
-anchor_init = re.compile(
+# ----- VIDEO alias -----
+# Anchor structure (appears twice — first in __init__, second in
+# get_groot_observation):
+#     <indent>if mapped_name == "video.ego_view_pad_res256_freq20":
+#     <indent>    <body>
+#     <indent>    )
+video_anchor = re.compile(
     r"(?P<indent>[ \t]+)if mapped_name == \"video\.ego_view_pad_res256_freq20\":\s*\n"
-    r"(?:[ \t]+.*\n)+?"                                # non-greedy body
-    r"[ \t]+\)\s*\n"                                   # closing paren of spaces.Box(...)
+    r"(?:[ \t]+.*\n)+?"
+    r"[ \t]+\)\s*\n"
 )
-# Anchor 2 (in get_groot_observation): the block that assigns
-# obs["video.ego_view_bg_crop_pad_res256_freq20"] = process_img_cotrain(...)
-anchor_step = re.compile(
-    r"(?P<indent>[ \t]+)if mapped_name == \"video\.ego_view_pad_res256_freq20\":\s*\n"
-    r"(?:[ \t]+.*\n)+?"                                # non-greedy body (the obs[...] = ... call)
-    r"[ \t]+\)\s*\n"                                   # closing paren of process_img_cotrain(...)
-)
-# Both anchors have identical STRUCTURE (both use the same `if` line),
-# so we distinguish by finding them in order — first occurrence is init,
-# second is get_groot_observation.
 
-matches = list(anchor_init.finditer(src))
-if len(matches) < 2:
-    sys.exit(
-        f"PATCH FAILED: expected 2 anchor blocks in {path}, "
-        f"found {len(matches)}. Edit by hand."
-    )
-
-# Injection for anchor 1 (observation_space).
-def make_space_alias(indent: str) -> str:
+def _video_space_injection(indent: str) -> str:
     return (
-        f"{indent}# {MARKER} — expose short-name key for newer checkpoints\n"
+        f"{indent}# {VIDEO_MARKER} — expose short-name key for newer checkpoints\n"
         f"{indent}self.observation_space[\"video.ego_view\"] = spaces.Box(\n"
         f"{indent}    low=0, high=255, shape=(*FINAL_IMAGE_RESOLUTION, 3), dtype=np.uint8\n"
         f"{indent})\n"
     )
 
-# Injection for anchor 2 (obs dict).
-def make_obs_alias(indent: str) -> str:
+def _video_obs_injection(indent: str) -> str:
     return (
-        f"{indent}# {MARKER} — mirror image under short key\n"
+        f"{indent}# {VIDEO_MARKER} — mirror image under short key\n"
         f"{indent}obs[\"video.ego_view\"] = obs[\"video.ego_view_pad_res256_freq20\"]\n"
     )
 
-# Insert in REVERSE order so earlier offsets aren't shifted.
-m2 = matches[1]
-m1 = matches[0]
+# ----- LANGUAGE alias -----
+# Anchor B1 (in __init__): the line RIGHT AFTER the whole
+#   if/elif/else annotation.human.* block. This is uniquely identified
+#   by `self.action_space = self.key_converter.deduce_action_space(self.env)`.
+#   We insert BEFORE this line so our declaration is at the same
+#   indentation as the surrounding statements — outside the if/elif/else.
+lang_space_anchor = re.compile(
+    r"(?P<indent>[ \t]+)self\.action_space = self\.key_converter\.deduce_action_space\(self\.env\)\s*\n"
+)
 
-indent2 = m2.group("indent")
-inj2 = make_obs_alias(indent2)
-src = src[: m2.end()] + inj2 + src[m2.end():]
+# Anchor B2 (in get_groot_observation): the terminating `return obs`
+#   line — again, outside the if/elif/else chain that assigns the
+#   language keys. We insert BEFORE it.
+lang_obs_anchor = re.compile(
+    r"(?P<indent>[ \t]+)return obs\s*\n"
+)
 
-indent1 = m1.group("indent")
-inj1 = make_space_alias(indent1)
-src = src[: m1.end()] + inj1 + src[m1.end():]
+def _lang_space_injection(indent: str) -> str:
+    # Reassignment is idempotent — safe even if the else-branch already set it.
+    return (
+        f"{indent}# {LANG_MARKER} — expose task_description key for newer checkpoints\n"
+        f"{indent}self.observation_space[\"annotation.human.action.task_description\"] = spaces.Text(\n"
+        f"{indent}    max_length=256, charset=ALLOWED_LANGUAGE_CHARSET\n"
+        f"{indent})\n"
+    )
+
+def _lang_obs_injection(indent: str) -> str:
+    # raw_obs['language'] is the un-prefixed task description; the
+    # "locked_waist: "/"unlocked_waist: " prefixes are added ONLY when
+    # writing to the coarse_action key above. So just mirror it.
+    # `setdefault` protects the pre-existing key when the else-branch
+    # (non-GR1 robots) already set it.
+    return (
+        f"{indent}# {LANG_MARKER} — mirror raw language under task_description key\n"
+        f"{indent}obs.setdefault(\"annotation.human.action.task_description\", raw_obs[\"language\"])\n"
+    )
+
+# ------------- APPLY -------------
+inserts = []  # list of (start_offset, injection_text)
+
+# Video alias — skip if already applied.
+if VIDEO_MARKER in src:
+    print(f"[patch]   video alias already present — skipping")
+else:
+    video_matches = list(video_anchor.finditer(src))
+    if len(video_matches) < 2:
+        sys.exit(
+            f"PATCH FAILED (video): expected 2 anchor blocks, "
+            f"found {len(video_matches)}. Edit by hand."
+        )
+    # A1 = first (in __init__), A2 = second (in get_groot_observation)
+    inserts.append((video_matches[0].end(), _video_space_injection(video_matches[0].group("indent"))))
+    inserts.append((video_matches[1].end(), _video_obs_injection(video_matches[1].group("indent"))))
+    print(f"[patch]   queued video alias (2 sites)")
+
+# Language alias — skip if already applied.
+if LANG_MARKER in src:
+    print(f"[patch]   language alias already present — skipping")
+else:
+    m_lspace = lang_space_anchor.search(src)
+    m_lobs = lang_obs_anchor.search(src)
+    if not m_lspace or not m_lobs:
+        sys.exit(
+            f"PATCH FAILED (language): could not find one or both anchors "
+            f"(space={bool(m_lspace)}, obs={bool(m_lobs)}). Edit by hand."
+        )
+    # Insert BEFORE these anchors — we're placing sibling statements
+    # outside the surrounding if/elif/else chain.
+    inserts.append((m_lspace.start(), _lang_space_injection(m_lspace.group("indent"))))
+    inserts.append((m_lobs.start(), _lang_obs_injection(m_lobs.group("indent"))))
+    print(f"[patch]   queued language alias (2 sites)")
+
+if not inserts:
+    print(f"[patch] Nothing to do — file is already fully patched.")
+    sys.exit(0)
+
+# Apply in REVERSE offset order so earlier insertions don't shift later offsets.
+for offset, text in sorted(inserts, key=lambda t: -t[0]):
+    src = src[:offset] + text + src[offset:]
 
 open(path, "w").write(src)
 print(f"[patch] Patched {path}")
 PY
 
-echo "[patch] verification:"
-grep -n "PATCHED_VIDEO_EGO_VIEW_ALIAS\|video.ego_view" "$FILE" | head -12
+echo ""
+echo "[patch] verification (marker occurrences):"
+grep -cE "PATCHED_VIDEO_EGO_VIEW_ALIAS|PATCHED_LANGUAGE_TASK_DESC_ALIAS" "$FILE" \
+    | xargs -I{} echo "  markers present: {}"
 
 echo ""
 echo "[patch] Sanity import check:"
-$PY - <<'PY'
+$PY - <<'PY' 2>/dev/null
 import robocasa.utils.gym_utils.gymnasium_groot as g
 src = open(g.__file__).read()
-assert 'obs["video.ego_view"] = obs["video.ego_view_pad_res256_freq20"]' in src, \
-    "PATCH DID NOT LAND — check the file by hand."
-assert 'self.observation_space["video.ego_view"] = spaces.Box(' in src, \
-    "PATCH DID NOT LAND (space) — check the file by hand."
-print("  ✓ both aliases present in", g.__file__)
+checks = [
+    ('video obs alias',   'obs["video.ego_view"] = obs["video.ego_view_pad_res256_freq20"]'),
+    ('video space alias', 'self.observation_space["video.ego_view"] = spaces.Box('),
+    ('lang obs alias',    'obs.setdefault("annotation.human.action.task_description", raw_obs["language"])'),
+    ('lang space alias',  'self.observation_space["annotation.human.action.task_description"] = spaces.Text('),
+]
+missing = [name for name, needle in checks if needle not in src]
+if missing:
+    raise SystemExit(f"  ✗ MISSING: {missing} — check {g.__file__} by hand.")
+print(f"  ✓ all 4 aliases present in {g.__file__}")
 PY
 
 echo ""
-echo "[patch] Done. Re-run the client — the 'video.ego_view' error should be gone."
-echo "        (State keys and language key already match. Next error, if any,"
-echo "         will be about action-key naming or shape.)"
+echo "[patch] Done. Re-run the client — the language-key error should be gone."
 echo ""
 echo "To revert:  mv $FILE.bak $FILE"
