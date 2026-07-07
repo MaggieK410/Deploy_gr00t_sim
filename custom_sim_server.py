@@ -43,10 +43,14 @@ Usage
     #   meta/info.json under `conversion.grip_normalization.max_mean_abs_*`.
 """
 
+import atexit
 from dataclasses import dataclass
+from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
+import torch
 import tyro
 
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -121,6 +125,7 @@ class CustomSimWrapper(PolicyWrapper):
         grip_max_right: float = 1.0,
         empty_hand_proprio: bool = False,
         right_hand_grasp_shape: np.ndarray | None = None,
+        record_attention_dir: str | None = None,
     ):
         super().__init__(policy, strict=strict)
         self.policy = policy
@@ -149,6 +154,48 @@ class CustomSimWrapper(PolicyWrapper):
             f"[wrapper] grip_max=(L:{grip_max_left}, R:{grip_max_right}), "
             f"empty_hand_proprio={empty_hand_proprio}, "
             f"right_hand_grasp_shape={self.right_hand_grasp_shape.tolist()}"
+        )
+
+        # ── Attention capture (mirrors deploy_groot.py) ──
+        # Same idiom as the real-robot deploy: attach a CaptureHandle to the
+        # DiT once, then reset()+read() per inference call. On shutdown, stack
+        # everything into one attention.npz next to a meta.json.
+        self.capture_handle = None
+        self.record_attention_dir: Path | None = None
+        self._chunks: list[dict] = []
+        self._call_idx: int = 0
+        self._run_start_ts: float = time.time()
+
+        if record_attention_dir is not None:
+            self._init_attention_capture(policy, record_attention_dir)
+
+    def _init_attention_capture(self, policy: Gr00tPolicy, out_dir: str) -> None:
+        try:
+            from capture_attention import attach as _attach_capture
+        except ImportError as e:
+            raise RuntimeError(
+                "record_attention_dir set but capture_attention.py isn't importable. "
+                "Copy creo-g1-teleop/capture_attention.py to a directory on PYTHONPATH."
+            ) from e
+        try:
+            dit = policy.model.action_head.model
+        except AttributeError as e:
+            raise RuntimeError(
+                "Could not find policy.model.action_head.model — expected the DiT "
+                "(or AlternateVLDiT). Check the checkpoint's model layout."
+            ) from e
+        self.capture_handle = _attach_capture(dit)
+
+        # One directory per server run so consecutive launches don't collide.
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.record_attention_dir = Path(out_dir) / f"run_{run_id}"
+        self.record_attention_dir.mkdir(parents=True, exist_ok=True)
+        atexit.register(self._save_attention)  # flush even on normal shutdown
+
+        print(
+            f"[wrapper] attention capture attached — {len(self.capture_handle.cross_block_indices)} "
+            f"cross blocks, {len(self.capture_handle.self_block_indices)} self blocks; "
+            f"writing to {self.record_attention_dir}"
         )
 
     # ───── Observation validation ─────
@@ -200,8 +247,15 @@ class CustomSimWrapper(PolicyWrapper):
             self._dump_shapes(nested)
             self._dumped_shapes = True
 
-        # Inference.
+        # Inference — bracket with attention capture reset/read.
+        if self.capture_handle is not None:
+            self.capture_handle.reset()
+
         action, info = self.policy.get_action(nested, options)
+
+        if self.capture_handle is not None:
+            captured = self.capture_handle.read()
+            self._record_chunk(nested["video"][MODEL_VIDEO_KEY], captured)
 
         # Model returns action["upper"] (B, T, 17) and action["r_trig"] (B, T, 1).
         if "upper" not in action or "r_trig" not in action:
@@ -267,6 +321,102 @@ class CustomSimWrapper(PolicyWrapper):
                 return text[len(prefix):]
         return text
 
+    # ───── attention capture ─────
+    def _record_chunk(self, video_batch: np.ndarray, captured: dict) -> None:
+        """Store one inference's capture. `video_batch` shape: (B, T, H, W, 3)."""
+        # Take latest frame per env → (B, H, W, 3) uint8.
+        img = np.asarray(video_batch)
+        if img.ndim == 5:
+            img = img[:, -1]
+        self._chunks.append({
+            "call_idx": self._call_idx,
+            "timestamp": time.time() - self._run_start_ts,
+            "image": img.astype(np.uint8, copy=False),
+            "cross": captured.get("cross"),
+            "self":  captured.get("self"),
+            "hidden": captured.get("hidden_states"),
+            "cross_block_indices": captured.get("cross_block_indices", []),
+            "self_block_indices":  captured.get("self_block_indices", []),
+            "all_block_indices":   captured.get("all_block_indices", []),
+        })
+        self._call_idx += 1
+
+    def _save_attention(self) -> None:
+        """Flush self._chunks to attention.npz. Called at shutdown."""
+        if not self._chunks or self.record_attention_dir is None:
+            return
+        out_path = self.record_attention_dir / "attention.npz"
+        payload: dict[str, Any] = {}
+
+        # Per-call metadata + input images.
+        payload["call_idx"] = np.array([c["call_idx"] for c in self._chunks], dtype=np.int32)
+        payload["timestamps"] = np.array([c["timestamp"] for c in self._chunks], dtype=np.float64)
+        # Images: (N_calls, B, H, W, 3) uint8.
+        payload["images"] = np.stack([c["image"] for c in self._chunks], axis=0)
+
+        # Attention tensors: only stack if EVERY call produced them.
+        def _stack_or_skip(key: str):
+            vals = [c[key] for c in self._chunks]
+            if all(v is not None for v in vals):
+                try:
+                    return torch.stack(vals, dim=0).numpy()
+                except Exception as e:
+                    print(f"[wrapper] failed to stack '{key}': {e}")
+            return None
+
+        cross = _stack_or_skip("cross")
+        if cross is not None:
+            payload["attentions"] = cross           # (N, n_denoise, n_cross_blocks, B, H, T_q, T_k_vlm)
+            payload["block_indices"] = np.array(
+                self._chunks[0]["cross_block_indices"], dtype=np.int32)
+
+        self_att = _stack_or_skip("self")
+        if self_att is not None:
+            payload["self_attentions"] = self_att   # (N, n_denoise, n_self_blocks, B, H, T_q, T_q)
+            payload["self_block_indices"] = np.array(
+                self._chunks[0]["self_block_indices"], dtype=np.int32)
+
+        hidden = _stack_or_skip("hidden")
+        if hidden is not None:
+            payload["hidden_states"] = hidden       # (N, n_denoise, n_blocks+1, B, T_q, D)
+            payload["hidden_block_indices"] = np.array(
+                self._chunks[0]["all_block_indices"], dtype=np.int32)
+
+        # VLM image-vs-text mask (constant per run).
+        if self.capture_handle is not None and self.capture_handle.image_mask is not None:
+            payload["image_mask"] = self.capture_handle.image_mask.numpy().astype(np.bool_)
+
+        # NOTE: savez (uncompressed) — same reasoning as deploy_groot.py:
+        # compression is a 20-45s CPU wall for ~10% saving on random floats.
+        np.savez(out_path, **payload)
+
+        meta = {
+            "n_calls": len(self._chunks),
+            "run_start": self._run_start_ts,
+            "run_end": time.time(),
+            "grip_max_left": self.grip_max_left,
+            "grip_max_right": self.grip_max_right,
+            "empty_hand_proprio": self.empty_hand_proprio,
+            "language_override": self.language_override,
+            "keys_written": sorted(payload.keys()),
+            "call_shapes": {
+                k: list(v.shape) for k, v in payload.items()
+                if hasattr(v, "shape")
+            },
+        }
+        import json
+        (self.record_attention_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        # Also detach so the model is left clean if the process keeps living
+        # for any reason (e.g. an atexit chain).
+        try:
+            if self.capture_handle is not None:
+                self.capture_handle.detach()
+        except Exception as e:
+            print(f"[wrapper] capture_handle.detach failed: {e}")
+
+        print(f"[wrapper] saved attention capture: {out_path} ({len(self._chunks)} calls)")
+
     def _dump_shapes(self, nested: dict[str, dict[str, Any]]) -> None:
         print("[wrapper] --- first obs: shape dump ---")
         for mod in ("video", "state"):
@@ -314,6 +464,11 @@ class ServerConfig:
     to produce a 6-DOF finger command. Default is all-1.0; tune based on
     inspecting an actual grasp in your dataset."""
 
+    record_attention_dir: str | None = None
+    """If set, attach a CaptureHandle to the DiT and dump attention +
+    hidden states to <this>/run_YYYYMMDD_HHMMSS/attention.npz on shutdown.
+    Requires capture_attention.py on PYTHONPATH (from creo-g1-teleop/)."""
+
 
 def _parse_grasp_shape(s: str) -> np.ndarray:
     vals = [float(x) for x in s.split(",")]
@@ -338,6 +493,7 @@ def main(cfg: ServerConfig):
         grip_max_right=cfg.grip_max_right,
         empty_hand_proprio=cfg.empty_hand_proprio,
         right_hand_grasp_shape=_parse_grasp_shape(cfg.right_hand_grasp_shape),
+        record_attention_dir=cfg.record_attention_dir,
     )
     print(f"[server] listening on {cfg.host}:{cfg.port}")
     server = PolicyServer(policy=wrapped, host=cfg.host, port=cfg.port)
@@ -345,6 +501,10 @@ def main(cfg: ServerConfig):
         server.run()
     except KeyboardInterrupt:
         print("\n[server] shutdown")
+    finally:
+        # Explicit flush — atexit also does this, but running it here means
+        # any print()s show before the process starts tearing down.
+        wrapped._save_attention()
 
 
 if __name__ == "__main__":
