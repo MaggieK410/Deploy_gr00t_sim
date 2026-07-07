@@ -85,6 +85,15 @@ class CustomSimWrapper(PolicyWrapper):
         super().__init__(policy, strict=strict)
         self.policy = policy
         self.language_override = language_override
+        self._dumped_shapes = False
+
+        # Log the model's declared state modality keys, so we can see at
+        # a glance what the wrapper is expected to feed.
+        try:
+            state_cfg = policy.modality_configs["state"]
+            print(f"[wrapper] model state modality_keys: {list(state_cfg.modality_keys)}")
+        except Exception as e:
+            print(f"[wrapper] could not introspect model state config: {e}")
 
     def check_observation(self, observation: dict[str, Any]) -> None:
         for env_key in VIDEO_KEY_MAP:
@@ -110,6 +119,20 @@ class CustomSimWrapper(PolicyWrapper):
             nested["video"][model_key] = observation[env_key]
         for env_key, model_key in STATE_KEY_MAP.items():
             nested["state"][model_key] = observation[env_key]
+
+        # One-shot shape dump. Prints ONCE per server run so we can see
+        # exactly what each state key looks like when normalization fails.
+        if not self._dumped_shapes:
+            print("[wrapper] --- first call: shape dump ---")
+            for mod in ("video", "state"):
+                for k, v in nested[mod].items():
+                    shape = getattr(v, "shape", None)
+                    dtype = getattr(v, "dtype", None)
+                    print(f"[wrapper]   {mod}.{k}: shape={shape}, dtype={dtype}")
+            print(f"[wrapper]   language[{LANGUAGE_MODEL_KEY}]: "
+                  f"{nested['language'][LANGUAGE_MODEL_KEY]!r}")
+            print("[wrapper] --- end shape dump ---")
+            self._dumped_shapes = True
 
         # Language modality: expected shape (B, T=1) as list[list[str]].
         batch_size = self._infer_batch_size(observation)
