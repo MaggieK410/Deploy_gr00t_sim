@@ -62,14 +62,25 @@ path = sys.argv[1]
 src = open(path).read()
 
 # Patch body written WITHOUT any baseline indent — we apply the captured
-# indent below. (Prior version had 4-space baseline + captured indent →
-# doubled indent → IndentationError.)
+# indent below. Two behaviors in one block:
+#   (1) Filter env_kwargs to what the target env class accepts (band-aid
+#       for robocasa passing newer robosuite kwargs like seed,
+#       translucent_robot).
+#   (2) Replace `env = robosuite.make(...)` with a try/retry loop that
+#       catches `ValueError: No "camera" with name X exists`, substitutes
+#       X with `robot0_robotview` (an available camera on the Lift scene),
+#       and retries. Handles any future missing-camera name too.
+FALLBACK_CAMERA = "robot0_robotview"
+
 patch_lines = [
     "# ── PATCHED (version drift band-aid) ───────────────────────────────",
-    "# robocasa was written against a newer robosuite that accepts extra",
-    "# kwargs (seed, translucent_robot, ...). robosuite@v1.5.1 doesn't.",
-    "# Filter env_kwargs to whatever the target env class actually accepts.",
+    "# (1) Filter env_kwargs to what the target env class accepts.",
+    "#     robocasa was written against a newer robosuite that has extra",
+    "#     kwargs (seed, translucent_robot, ...); robosuite@v1.5.1 doesn't.",
+    "# (2) On missing-camera ValueError from robosuite.make, substitute the",
+    f'#     missing camera name with "{FALLBACK_CAMERA}" and retry.',
     "import inspect as _insp",
+    "import re as _re",
     "from robosuite.environments.base import REGISTERED_ENVS as _REG",
     "_en = env_kwargs.get(\"env_name\")",
     "if _en in _REG:",
@@ -77,12 +88,38 @@ patch_lines = [
     "    _accepted = set(_insp.signature(_cls.__init__).parameters.keys())",
     "    env_kwargs = {k: v for k, v in env_kwargs.items()",
     "                  if k in _accepted or k == \"env_name\"}",
+    f'_FALLBACK_CAM = "{FALLBACK_CAMERA}"',
+    "for _try in range(8):",
+    "    try:",
+    "        env = robosuite.make(**env_kwargs)",
+    "        break",
+    "    except ValueError as _e:",
+    "        _mcam = _re.search(r'No \"camera\" with name (\\S+) exists', str(_e))",
+    "        if _mcam and \"camera_names\" in env_kwargs:",
+    "            _bad = _mcam.group(1)",
+    "            _cams = list(env_kwargs[\"camera_names\"])",
+    "            if _bad in _cams:",
+    "                _idx = _cams.index(_bad)",
+    "                if _FALLBACK_CAM in _cams:",
+    "                    del _cams[_idx]",
+    "                else:",
+    "                    _cams[_idx] = _FALLBACK_CAM",
+    "                print(f'[robocasa patch] camera \"{_bad}\" missing from '",
+    "                      f'scene; substituting -> \"{_FALLBACK_CAM}\" '",
+    "                      f'(result: {_cams})')",
+    "                env_kwargs[\"camera_names\"] = _cams",
+    "                continue",
+    "        raise",
+    "else:",
+    "    raise RuntimeError('Failed after 8 camera-substitution retries')",
     "# ── END PATCH ──────────────────────────────────────────────────────",
 ]
 
 # Find `env = robosuite.make(**env_kwargs)`, preserving its leading whitespace.
+# We REPLACE that line entirely — our patch contains its own robosuite.make
+# call inside the retry loop, so the original line must not run twice.
 call_pat = re.compile(
-    r"^(?P<indent>[ \t]*)env\s*=\s*robosuite\.make\(\*\*env_kwargs\)\s*$",
+    r"^(?P<indent>[ \t]*)env\s*=\s*robosuite\.make\(\*\*env_kwargs\)[ \t]*\n",
     re.MULTILINE,
 )
 m = call_pat.search(src)
@@ -96,7 +133,7 @@ if not m:
 indent = m.group("indent")
 indented_patch = "".join(indent + line + "\n" for line in patch_lines)
 
-new_src = src[: m.start()] + indented_patch + src[m.start():]
+new_src = src[: m.start()] + indented_patch + src[m.end():]
 open(path, "w").write(new_src)
 print(f"[patch] Patched {path}")
 PY
