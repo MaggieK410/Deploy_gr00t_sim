@@ -380,10 +380,18 @@ class CustomSimWrapper(PolicyWrapper):
 
         now = time.time() - self._run_start_ts
 
+        # A slot with ep_id == -1 is an "excess" slot: the client has already
+        # handed out n_episodes ep_ids and this slot's data isn't going to
+        # be saved.  Skip meta bookkeeping for these entirely.
+        def _is_valid(ep_id: int) -> bool:
+            return ep_id >= 0
+
         # First call: register every slot's initial episode.
         if self._last_slot_ep_ids is None:
             self._last_slot_ep_ids = slot_ep_ids.copy()
             for slot, ep_id in enumerate(slot_ep_ids.tolist()):
+                if not _is_valid(ep_id):
+                    continue
                 self._episode_meta.setdefault(int(ep_id), {
                     "episode_id": int(ep_id),
                     "slot": int(slot),
@@ -399,21 +407,23 @@ class CustomSimWrapper(PolicyWrapper):
                 incoming = int(slot_ep_ids[slot])
                 outgoing = int(self._last_slot_ep_ids[slot])
                 if incoming != outgoing:
-                    if outgoing in self._episode_meta and self._episode_meta[outgoing]["end_ts"] is None:
+                    if _is_valid(outgoing) and outgoing in self._episode_meta and self._episode_meta[outgoing]["end_ts"] is None:
                         self._episode_meta[outgoing]["end_ts"] = now
-                    self._episode_meta.setdefault(incoming, {
-                        "episode_id": incoming,
-                        "slot": int(slot),
-                        "start_ts": now,
-                        "end_ts": None,
-                        "n_calls": 0,
-                    })
+                    if _is_valid(incoming):
+                        self._episode_meta.setdefault(incoming, {
+                            "episode_id": incoming,
+                            "slot": int(slot),
+                            "start_ts": now,
+                            "end_ts": None,
+                            "n_calls": 0,
+                        })
             self._last_slot_ep_ids = slot_ep_ids.copy()
 
-        # Bump n_calls for every slot's currently active episode.
+        # Bump n_calls for every slot's currently active episode (excess slots
+        # are skipped since they were never registered in _episode_meta).
         for slot in range(batch_size):
             ep_id = int(slot_ep_ids[slot])
-            if ep_id in self._episode_meta:
+            if _is_valid(ep_id) and ep_id in self._episode_meta:
                 self._episode_meta[ep_id]["n_calls"] += 1
 
         return slot_ep_ids
@@ -477,11 +487,15 @@ class CustomSimWrapper(PolicyWrapper):
         import signal
 
         # Close out any episodes that were still "open" when the server died.
+        # Excess slots (ep_id == -1) don't have meta entries; skip them.
         now = time.time() - self._run_start_ts
         if self._last_slot_ep_ids is not None:
             for ep_id in self._last_slot_ep_ids.tolist():
-                if ep_id is not None and self._episode_meta.get(int(ep_id), {}).get("end_ts") is None:
-                    self._episode_meta[int(ep_id)]["end_ts"] = now
+                ep_id = int(ep_id)
+                if ep_id < 0:
+                    continue
+                if self._episode_meta.get(ep_id, {}).get("end_ts") is None and ep_id in self._episode_meta:
+                    self._episode_meta[ep_id]["end_ts"] = now
 
         # Constant across episodes:
         cross_block_indices = np.array(
@@ -498,11 +512,16 @@ class CustomSimWrapper(PolicyWrapper):
             image_mask = self.capture_handle.image_mask.numpy().astype(np.bool_)
 
         # Group chunks by episode. For each episode we need a list of
-        # (chunk, slot_within_chunk) pointers.
+        # (chunk, slot_within_chunk) pointers.  Slots with ep_id == -1 are
+        # "excess" (the client's counter had already hit n_episodes) and
+        # we skip them here so no npz is written for their data.
         episode_hits: dict[int, list[tuple[int, int]]] = {}
         for chunk_idx, c in enumerate(self._chunks):
             for slot, ep_id in enumerate(c["slot_ep_ids"]):
-                episode_hits.setdefault(int(ep_id), []).append((chunk_idx, slot))
+                ep_id_i = int(ep_id)
+                if ep_id_i < 0:
+                    continue
+                episode_hits.setdefault(ep_id_i, []).append((chunk_idx, slot))
 
         # Build the manifest up front with `written: false` for every episode.
         episodes_json: list[dict] = []

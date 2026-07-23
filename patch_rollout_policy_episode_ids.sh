@@ -131,10 +131,19 @@ if not m_tail:
     sys.exit("PATCH FAILED: could not find `current_lengths[env_idx] = 0`")
 
 tail_indent = m_tail.group("indent")
+# Cap the counter at n_episodes.  Any extra terminations after we've
+# already handed out n_episodes ep_ids get a sentinel (-1) which the
+# server drops.  This means we never save more than n_episodes files
+# even though the async vec envs may have started more physical
+# episodes in parallel.
 inject_after_tail = (
-    f"{tail_indent}# {MARKER} — bump slot's episode id (fresh id for the auto-reset env)\n"
-    f"{tail_indent}_slot_ep_ids[env_idx] = _next_ep_id\n"
-    f"{tail_indent}_next_ep_id += 1\n"
+    f"{tail_indent}# {MARKER} — assign a fresh ep_id if we still need more\n"
+    f"{tail_indent}#            episodes; otherwise mark the slot as excess.\n"
+    f"{tail_indent}if _next_ep_id < n_episodes:\n"
+    f"{tail_indent}    _slot_ep_ids[env_idx] = _next_ep_id\n"
+    f"{tail_indent}    _next_ep_id += 1\n"
+    f"{tail_indent}else:\n"
+    f"{tail_indent}    _slot_ep_ids[env_idx] = -1  # sentinel: server ignores\n"
 )
 
 # Apply in reverse offset order so earlier insertions don't shift later ones.
