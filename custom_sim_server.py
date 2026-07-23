@@ -629,9 +629,12 @@ class CustomSimWrapper(PolicyWrapper):
 
                 fname = ep["npz"]
                 out_path = self.record_attention_dir / fname
-                # Write to a `.tmp` sibling and rename atomically so a
-                # partially-written .npz never lingers.
-                tmp_path = self.record_attention_dir / (fname + ".tmp")
+                # Write to a `.tmp.npz` sibling and rename atomically so a
+                # partially-written file never lingers.  Note the extension
+                # order: np.savez appends `.npz` if the filename doesn't
+                # already end in it — so we need `.tmp.npz`, not `.npz.tmp`,
+                # or we'd end up writing `<name>.npz.tmp.npz`.
+                tmp_path = self.record_attention_dir / (fname[:-4] + ".tmp.npz")
                 print(
                     f"[wrapper] writing episode {ep_id:04d} "
                     f"({ep_index + 1}/{len(episodes_json)}, {len(hits)} calls) -> {fname}",

@@ -79,7 +79,12 @@ def _load_episodes(attn_dir: Path) -> list[dict]:
 
     print(f"[pair] {ep_path.name} missing — reconstructing from .npz files")
     import numpy as np  # local import so the script is fast when the manifest exists
-    npzs = sorted(attn_dir.glob("episode_*.npz"))
+    # Deliberately exclude `episode_XXXX.tmp.npz` (in-flight atomic write) and
+    # any older `episode_XXXX.npz.tmp.npz` (from the earlier writer bug).
+    npzs = sorted(
+        p for p in attn_dir.glob("episode_*.npz")
+        if not p.name.endswith(".tmp.npz")
+    )
     if not npzs:
         raise SystemExit(
             f"neither {ep_path} nor any episode_*.npz files under {attn_dir}. "
