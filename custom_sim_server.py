@@ -160,15 +160,17 @@ class CustomSimWrapper(PolicyWrapper):
         # Same idiom as the real-robot deploy: attach a CaptureHandle to the
         # DiT once, then reset()+read() per inference call.  Per-episode
         # bookkeeping is layered on top:
-        #   - `_slot_last_state[i]` = last observed concatenated state for
-        #     batch slot i.  A large L2 jump vs. the incoming state signals
-        #     that slot i has been reset (new episode).
-        #   - `_slot_ep_id[i]` = the global episode id currently assigned to
-        #     slot i.  Starts at None; every fresh assignment (first call
-        #     seen for that slot, or any subsequent reset) bumps
-        #     `_next_global_ep_id`.
-        #   - `_episode_meta[ep_id]` accumulates start/end timestamp + which
-        #     slot ran it, dumped as episodes.json at shutdown.
+        #   - Each incoming observation carries a `slot_ep_ids: (B,) int32`
+        #     array put there by the patched `rollout_policy.py` on the
+        #     client.  It's the global episode id currently assigned to
+        #     each vec-env slot.  The server just trusts these values —
+        #     the client is the ground truth for what an "episode" means.
+        #   - `_last_slot_ep_ids[i]` remembers what episode id slot i had
+        #     on the previous call, so we can stamp end_ts on the closed
+        #     episode when slot i transitions to a new id.
+        #   - `_episode_meta[ep_id]` accumulates start/end timestamp,
+        #     which slot ran it, and n_calls, dumped as episodes.json
+        #     at shutdown.
         # At shutdown, chunks are split by (slot, ep_id) and one .npz is
         # written per episode.
         self.capture_handle = None
@@ -177,16 +179,10 @@ class CustomSimWrapper(PolicyWrapper):
         self._call_idx: int = 0
         self._run_start_ts: float = time.time()
 
-        # Per-slot reset detection state (lazy-init on first call once we
-        # know the batch size).
-        self._slot_last_state: list[np.ndarray | None] | None = None
-        self._slot_ep_id: list[int | None] | None = None
-        self._next_global_ep_id: int = 0
+        # Per-slot episode tracking. Populated on the first call once we see
+        # `slot_ep_ids` in the observation.
+        self._last_slot_ep_ids: np.ndarray | None = None
         self._episode_meta: dict[int, dict] = {}
-        # An L2 jump of >0.5 rad across the whole 28-D state between
-        # consecutive control steps is huge; real controlled transitions
-        # sit well under 0.2 rad at 20 Hz. 0.5 is a comfortable margin.
-        self._reset_threshold: float = 0.5
 
         if record_attention_dir is not None:
             self._init_attention_capture(policy, record_attention_dir)
@@ -269,20 +265,14 @@ class CustomSimWrapper(PolicyWrapper):
             self._dump_shapes(nested)
             self._dumped_shapes = True
 
-        # Per-slot reset detection.  Compute a compact per-slot state vector
-        # (concatenate arms + hands) and compare to the last one we saw.
-        # A large L2 jump means that slot has been reset — reassign its
-        # episode id and stamp the previous episode's end time.
-        slot_states = np.concatenate(
-            [
-                nested["state"]["left_arm"],
-                nested["state"]["right_arm"],
-                nested["state"]["left_hand"],
-                nested["state"]["right_hand"],
-            ],
-            axis=-1,
-        )  # (B, D)
-        slot_ep_id_this_call = self._assign_episode_ids(slot_states)
+        # Per-slot episode ids come from the client — the patched
+        # rollout_policy.py stuffs `slot_ep_ids: (B,) int32` into the
+        # observation before every `policy.get_action` call.  We read it
+        # here and update our meta dict; no discontinuity detection
+        # needed.  Fall back to a single always-slot-0 episode if the
+        # key is missing (unpatched client) so runs still work — just
+        # with all captures grouped as one episode.
+        slot_ep_id_this_call = self._read_slot_ep_ids(observation)
 
         # Inference — bracket with attention capture reset/read.
         if self.capture_handle is not None:
@@ -363,55 +353,70 @@ class CustomSimWrapper(PolicyWrapper):
         return text
 
     # ───── attention capture ─────
-    def _assign_episode_ids(self, slot_states: np.ndarray) -> np.ndarray:
-        """Return the global episode id for each of the B slots on this call.
+    def _read_slot_ep_ids(self, observation: dict[str, Any]) -> np.ndarray:
+        """Read `slot_ep_ids` from the observation (put there by the patched
+        `rollout_policy.py`) and update per-episode meta.  If the key is
+        missing (unpatched client), synthesize a run that treats every call
+        as belonging to the same single episode 0 — noisy but non-fatal."""
+        batch_size = self._infer_batch_size(observation)
+        raw = observation.get("slot_ep_ids")
+        if raw is None:
+            if not getattr(self, "_warned_missing_ep_ids", False):
+                print(
+                    "[wrapper] WARN: observation has no 'slot_ep_ids' — the "
+                    "client isn't patched.  Everything will be grouped as "
+                    "one episode.  Apply patch_rollout_policy_episode_ids.sh "
+                    "to fix."
+                )
+                self._warned_missing_ep_ids = True
+            slot_ep_ids = np.zeros(batch_size, dtype=np.int32)
+        else:
+            slot_ep_ids = np.asarray(raw, dtype=np.int32).reshape(-1)
+            if slot_ep_ids.size != batch_size:
+                raise ValueError(
+                    f"slot_ep_ids length {slot_ep_ids.size} does not match "
+                    f"batch size {batch_size}"
+                )
 
-        On the first call, every slot gets a fresh id.  On later calls,
-        any slot whose state jumps by more than `_reset_threshold` in L2
-        gets a fresh id (and the previous episode's end timestamp is
-        stamped in `_episode_meta`).
-        """
-        B = slot_states.shape[0]
         now = time.time() - self._run_start_ts
 
-        if self._slot_last_state is None:
-            self._slot_last_state = [None] * B
-            self._slot_ep_id = [None] * B
-        elif len(self._slot_last_state) != B:
-            # Batch size changed unexpectedly — reset from scratch.  Shouldn't
-            # happen in normal rollouts, but be defensive.
-            print(
-                f"[wrapper] batch size changed {len(self._slot_last_state)} -> {B}; "
-                f"reinitializing per-slot state"
-            )
-            self._slot_last_state = [None] * B
-            self._slot_ep_id = [None] * B
-
-        out = np.empty(B, dtype=np.int32)
-        for i in range(B):
-            prev = self._slot_last_state[i]
-            is_reset = prev is None or (
-                np.linalg.norm(slot_states[i] - prev) > self._reset_threshold
-            )
-            if is_reset:
-                # Close out the previous episode on this slot, if any.
-                if self._slot_ep_id[i] is not None:
-                    self._episode_meta[self._slot_ep_id[i]]["end_ts"] = now
-                # Open a new episode on this slot.
-                new_ep = self._next_global_ep_id
-                self._next_global_ep_id += 1
-                self._slot_ep_id[i] = new_ep
-                self._episode_meta[new_ep] = {
-                    "episode_id": new_ep,
-                    "slot": i,
+        # First call: register every slot's initial episode.
+        if self._last_slot_ep_ids is None:
+            self._last_slot_ep_ids = slot_ep_ids.copy()
+            for slot, ep_id in enumerate(slot_ep_ids.tolist()):
+                self._episode_meta.setdefault(int(ep_id), {
+                    "episode_id": int(ep_id),
+                    "slot": int(slot),
                     "start_ts": now,
-                    "end_ts": None,  # patched at next reset or at shutdown
+                    "end_ts": None,
                     "n_calls": 0,
-                }
-            out[i] = self._slot_ep_id[i]
-            self._episode_meta[self._slot_ep_id[i]]["n_calls"] += 1
-            self._slot_last_state[i] = slot_states[i].copy()
-        return out
+                })
+        else:
+            # Subsequent calls: any slot whose id changed just started a new
+            # episode.  Stamp end_ts on the outgoing episode and open a new
+            # entry for the incoming one.
+            for slot in range(batch_size):
+                incoming = int(slot_ep_ids[slot])
+                outgoing = int(self._last_slot_ep_ids[slot])
+                if incoming != outgoing:
+                    if outgoing in self._episode_meta and self._episode_meta[outgoing]["end_ts"] is None:
+                        self._episode_meta[outgoing]["end_ts"] = now
+                    self._episode_meta.setdefault(incoming, {
+                        "episode_id": incoming,
+                        "slot": int(slot),
+                        "start_ts": now,
+                        "end_ts": None,
+                        "n_calls": 0,
+                    })
+            self._last_slot_ep_ids = slot_ep_ids.copy()
+
+        # Bump n_calls for every slot's currently active episode.
+        for slot in range(batch_size):
+            ep_id = int(slot_ep_ids[slot])
+            if ep_id in self._episode_meta:
+                self._episode_meta[ep_id]["n_calls"] += 1
+
+        return slot_ep_ids
 
     def _record_chunk(
         self,
@@ -434,8 +439,8 @@ class CustomSimWrapper(PolicyWrapper):
             "cross_block_indices": captured.get("cross_block_indices", []),
             "self_block_indices":  captured.get("self_block_indices", []),
             "all_block_indices":   captured.get("all_block_indices", []),
-            # Per-slot episode id assigned by _assign_episode_ids — one entry
-            # per batch slot, dtype int32, shape (B,).
+            # Per-slot episode id read from the client's observation — one
+            # entry per batch slot, dtype int32, shape (B,).
             "slot_ep_ids": slot_ep_ids.copy(),
         })
         self._call_idx += 1
@@ -443,29 +448,40 @@ class CustomSimWrapper(PolicyWrapper):
     def _save_attention(self) -> None:
         """Flush self._chunks into per-episode npz files.
 
-        Each episode E is identified by a `(slot, episode_id)` pair — the id
-        was assigned by `_assign_episode_ids` on the first call after that
-        slot was reset.  For a given E we walk the recorded chunks and, for
-        each call in which slot S had episode id E, extract that slot's
-        slice of image + attention tensors and stack them along a new
-        time axis.
+        Save order is deliberately:
+          1. `episodes.json` (the manifest) — tiny, always written first,
+             marks each episode with `"written": false`.
+          2. `meta.json` — run-level config.
+          3. Each `episode_XXXX.npz` — huge, may take seconds each.  After
+             every successful write, `episodes.json` is atomically
+             rewritten with `"written": true` for that episode.
 
-        Output layout under `self.record_attention_dir`:
-            episode_0000.npz
-            episode_0001.npz
-            ...
-            episodes.json       # id -> {slot, start_ts, end_ts, n_calls, npz}
-            meta.json           # run-level config (grip max, language override)
+        This means the downstream `pair_videos_to_episodes.py` can pair
+        against a partially-written run (or reconstruct from the npz
+        files alone if `episodes.json` never landed — it walks the dir
+        as a fallback).
+
+        Ctrl-C during the tensor writes is handled: we install a SIGINT
+        guard that catches the first interrupt, warns, and lets the
+        current npz finish; a second Ctrl-C is honoured and stops early.
+        Whatever episodes did land are already recorded in the manifest.
         """
         if not self._chunks or self.record_attention_dir is None:
             return
+        # Idempotency guard: atexit + explicit finally will both call us.
+        if getattr(self, "_save_done", False):
+            return
+        self._save_done = True
+
+        import json
+        import signal
 
         # Close out any episodes that were still "open" when the server died.
         now = time.time() - self._run_start_ts
-        if self._slot_ep_id is not None:
-            for ep_id in self._slot_ep_id:
-                if ep_id is not None and self._episode_meta.get(ep_id, {}).get("end_ts") is None:
-                    self._episode_meta[ep_id]["end_ts"] = now
+        if self._last_slot_ep_ids is not None:
+            for ep_id in self._last_slot_ep_ids.tolist():
+                if ep_id is not None and self._episode_meta.get(int(ep_id), {}).get("end_ts") is None:
+                    self._episode_meta[int(ep_id)]["end_ts"] = now
 
         # Constant across episodes:
         cross_block_indices = np.array(
@@ -488,91 +504,31 @@ class CustomSimWrapper(PolicyWrapper):
             for slot, ep_id in enumerate(c["slot_ep_ids"]):
                 episode_hits.setdefault(int(ep_id), []).append((chunk_idx, slot))
 
+        # Build the manifest up front with `written: false` for every episode.
         episodes_json: list[dict] = []
         for ep_id in sorted(episode_hits.keys()):
             hits = episode_hits[ep_id]
             meta = self._episode_meta.get(ep_id, {"slot": hits[0][1]})
-            slot = meta["slot"]
-
-            # Build per-time-step arrays for this episode by slicing the
-            # right slot out of each hit chunk.
-            call_indices = np.array(
-                [self._chunks[ci]["call_idx"] for ci, _ in hits], dtype=np.int32
-            )
-            timestamps = np.array(
-                [self._chunks[ci]["timestamp"] for ci, _ in hits], dtype=np.float64
-            )
-            images = np.stack(
-                [self._chunks[ci]["image"][s] for ci, s in hits], axis=0
-            )  # (T, H, W, 3)
-
-            payload: dict[str, Any] = {
-                "episode_id": np.int32(ep_id),
-                "slot": np.int32(slot),
-                "call_idx": call_indices,
-                "timestamps": timestamps,
-                "images": images,
-            }
-
-            def _slice_or_none(key: str, slot_axis: int):
-                vals = [self._chunks[ci][key] for ci, _ in hits]
-                if not all(v is not None for v in vals):
-                    return None
-                try:
-                    per_call_slot = []
-                    for (ci, s), v in zip(hits, vals):
-                        # v is a torch.Tensor; select this call's slot along
-                        # `slot_axis` and drop that axis.
-                        per_call_slot.append(v.select(dim=slot_axis, index=s))
-                    return torch.stack(per_call_slot, dim=0).numpy()
-                except Exception as e:
-                    print(f"[wrapper] failed to slice '{key}' for ep {ep_id}: {e}")
-                    return None
-
-            # cross shape per call: (n_denoise, n_cross_blocks, B, H, T_q, T_k_vlm)
-            # → slot axis is 2.  After slice+stack: (T, n_denoise, n_cross_blocks, H, T_q, T_k_vlm)
-            cross = _slice_or_none("cross", slot_axis=2)
-            if cross is not None:
-                payload["attentions"] = cross
-                payload["block_indices"] = cross_block_indices
-
-            self_att = _slice_or_none("self", slot_axis=2)
-            if self_att is not None:
-                payload["self_attentions"] = self_att
-                payload["self_block_indices"] = self_block_indices
-
-            # hidden shape per call: (n_denoise, n_blocks+1, B, T_q, D) → slot axis 2
-            hidden = _slice_or_none("hidden", slot_axis=2)
-            if hidden is not None:
-                payload["hidden_states"] = hidden
-                payload["hidden_block_indices"] = hidden_block_indices
-
-            if image_mask is not None:
-                payload["image_mask"] = image_mask
-
-            fname = f"episode_{ep_id:04d}.npz"
-            out_path = self.record_attention_dir / fname
-            np.savez(out_path, **payload)
-
             episodes_json.append({
-                "episode_id": ep_id,
-                "slot": int(slot),
+                "episode_id": int(ep_id),
+                "slot": int(meta.get("slot", hits[0][1])),
                 "start_ts": meta.get("start_ts"),
                 "end_ts": meta.get("end_ts"),
                 "n_calls": meta.get("n_calls", len(hits)),
-                "npz": fname,
+                "npz": f"episode_{ep_id:04d}.npz",
+                "written": False,
             })
 
-        # Global manifest so a downstream pairing script can find each npz
-        # + video without re-reading the individual files.
-        import json
-        (self.record_attention_dir / "episodes.json").write_text(
-            json.dumps(episodes_json, indent=2)
-        )
+        def _write_manifest() -> None:
+            """Atomic write of episodes.json (temp file + os.replace)."""
+            tmp = self.record_attention_dir / "episodes.json.tmp"
+            tmp.write_text(json.dumps(episodes_json, indent=2))
+            tmp.replace(self.record_attention_dir / "episodes.json")
 
-        # Run-level config (unchanged from before, just no per-call tensor
-        # shapes since those now live in the per-episode npzs).
-        meta = {
+        _write_manifest()
+
+        # Run-level config lands early too so `meta.json` is always present.
+        meta_payload = {
             "n_calls_total": len(self._chunks),
             "n_episodes": len(episodes_json),
             "run_start": self._run_start_ts,
@@ -581,9 +537,119 @@ class CustomSimWrapper(PolicyWrapper):
             "grip_max_right": self.grip_max_right,
             "empty_hand_proprio": self.empty_hand_proprio,
             "language_override": self.language_override,
-            "reset_threshold_l2": self._reset_threshold,
+            "episode_source": "client_slot_ep_ids",
         }
-        (self.record_attention_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        (self.record_attention_dir / "meta.json").write_text(
+            json.dumps(meta_payload, indent=2)
+        )
+
+        # SIGINT tolerance: first Ctrl-C is buffered; second one raises.
+        # We restore the original handler at the end.
+        _saved_handler = signal.getsignal(signal.SIGINT)
+        _interrupt_state = {"count": 0}
+
+        def _on_sigint(signum, frame):
+            _interrupt_state["count"] += 1
+            if _interrupt_state["count"] == 1:
+                print(
+                    "\n[wrapper] Ctrl-C received during save — finishing current "
+                    "episode and stopping. Press Ctrl-C again to abort immediately."
+                )
+            else:
+                print("\n[wrapper] second Ctrl-C — aborting save.")
+                signal.signal(signal.SIGINT, _saved_handler)
+                raise KeyboardInterrupt
+
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+        except (ValueError, OSError):
+            # signal.signal only works on the main thread; if we're being
+            # called from an atexit chain in a non-main thread, just skip
+            # the guard.
+            pass
+
+        try:
+            for ep_index, ep in enumerate(episodes_json):
+                if _interrupt_state["count"] >= 1:
+                    print(f"[wrapper] stopping early — {ep_index}/{len(episodes_json)} episodes written")
+                    break
+
+                ep_id = ep["episode_id"]
+                hits = episode_hits[ep_id]
+                slot = ep["slot"]
+
+                call_indices = np.array(
+                    [self._chunks[ci]["call_idx"] for ci, _ in hits], dtype=np.int32
+                )
+                timestamps = np.array(
+                    [self._chunks[ci]["timestamp"] for ci, _ in hits], dtype=np.float64
+                )
+                images = np.stack(
+                    [self._chunks[ci]["image"][s] for ci, s in hits], axis=0
+                )  # (T, H, W, 3)
+
+                payload: dict[str, Any] = {
+                    "episode_id": np.int32(ep_id),
+                    "slot": np.int32(slot),
+                    "call_idx": call_indices,
+                    "timestamps": timestamps,
+                    "images": images,
+                }
+
+                def _slice_or_none(key: str, slot_axis: int):
+                    vals = [self._chunks[ci][key] for ci, _ in hits]
+                    if not all(v is not None for v in vals):
+                        return None
+                    try:
+                        per_call_slot = []
+                        for (ci, s), v in zip(hits, vals):
+                            per_call_slot.append(v.select(dim=slot_axis, index=s))
+                        return torch.stack(per_call_slot, dim=0).numpy()
+                    except Exception as e:
+                        print(f"[wrapper] failed to slice '{key}' for ep {ep_id}: {e}")
+                        return None
+
+                cross = _slice_or_none("cross", slot_axis=2)
+                if cross is not None:
+                    payload["attentions"] = cross
+                    payload["block_indices"] = cross_block_indices
+
+                self_att = _slice_or_none("self", slot_axis=2)
+                if self_att is not None:
+                    payload["self_attentions"] = self_att
+                    payload["self_block_indices"] = self_block_indices
+
+                hidden = _slice_or_none("hidden", slot_axis=2)
+                if hidden is not None:
+                    payload["hidden_states"] = hidden
+                    payload["hidden_block_indices"] = hidden_block_indices
+
+                if image_mask is not None:
+                    payload["image_mask"] = image_mask
+
+                fname = ep["npz"]
+                out_path = self.record_attention_dir / fname
+                # Write to a `.tmp` sibling and rename atomically so a
+                # partially-written .npz never lingers.
+                tmp_path = self.record_attention_dir / (fname + ".tmp")
+                print(
+                    f"[wrapper] writing episode {ep_id:04d} "
+                    f"({ep_index + 1}/{len(episodes_json)}, {len(hits)} calls) -> {fname}",
+                    flush=True,
+                )
+                np.savez(tmp_path, **payload)
+                tmp_path.replace(out_path)
+
+                # Mark this episode written and refresh the manifest so a
+                # crash between here and the next episode still leaves an
+                # accurate index on disk.
+                ep["written"] = True
+                _write_manifest()
+        finally:
+            try:
+                signal.signal(signal.SIGINT, _saved_handler)
+            except (ValueError, OSError):
+                pass
 
         # Also detach so the model is left clean if the process keeps living
         # for any reason (e.g. an atexit chain).
@@ -593,8 +659,9 @@ class CustomSimWrapper(PolicyWrapper):
         except Exception as e:
             print(f"[wrapper] capture_handle.detach failed: {e}")
 
+        n_written = sum(1 for ep in episodes_json if ep.get("written"))
         print(
-            f"[wrapper] saved {len(episodes_json)} per-episode npz files "
+            f"[wrapper] saved {n_written}/{len(episodes_json)} per-episode npz files "
             f"({len(self._chunks)} calls total) to {self.record_attention_dir}"
         )
 

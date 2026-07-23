@@ -66,10 +66,51 @@ def _resolve_video_dir(spec: str | None) -> Path:
 
 
 def _load_episodes(attn_dir: Path) -> list[dict]:
+    """Load episodes.json if it exists.  If not, reconstruct a best-effort
+    manifest by scanning any `episode_XXXX.npz` files in the run directory.
+
+    The reconstruction reads each npz's `episode_id`, `slot`, and the first +
+    last `timestamps` value to fill in `start_ts` / `end_ts` — enough for the
+    mtime-based video pairing below to work.
+    """
     ep_path = attn_dir / "episodes.json"
-    if not ep_path.exists():
-        raise SystemExit(f"missing {ep_path} — did custom_sim_server.py finish cleanly?")
-    return json.loads(ep_path.read_text())
+    if ep_path.exists():
+        return json.loads(ep_path.read_text())
+
+    print(f"[pair] {ep_path.name} missing — reconstructing from .npz files")
+    import numpy as np  # local import so the script is fast when the manifest exists
+    npzs = sorted(attn_dir.glob("episode_*.npz"))
+    if not npzs:
+        raise SystemExit(
+            f"neither {ep_path} nor any episode_*.npz files under {attn_dir}. "
+            f"Did the server run at all with --record-attention-dir?"
+        )
+
+    reconstructed: list[dict] = []
+    for p in npzs:
+        try:
+            with np.load(p, allow_pickle=False) as z:
+                ep_id = int(z["episode_id"])
+                slot = int(z["slot"])
+                ts = z["timestamps"]
+                start_ts = float(ts[0]) if len(ts) else None
+                end_ts = float(ts[-1]) if len(ts) else None
+                n_calls = int(len(ts))
+        except Exception as e:
+            print(f"[pair]   skipping {p.name}: {e}")
+            continue
+        reconstructed.append({
+            "episode_id": ep_id,
+            "slot": slot,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "n_calls": n_calls,
+            "npz": p.name,
+            "written": True,
+        })
+    reconstructed.sort(key=lambda e: e["episode_id"])
+    print(f"[pair]   reconstructed {len(reconstructed)} episodes from .npz files")
+    return reconstructed
 
 
 def _list_videos_by_mtime(video_dir: Path) -> list[Path]:
