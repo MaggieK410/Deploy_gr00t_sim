@@ -50,7 +50,6 @@ import time
 from typing import Any
 
 import numpy as np
-import torch
 import tyro
 
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -169,13 +168,29 @@ class CustomSimWrapper(PolicyWrapper):
         #     on the previous call, so we can stamp end_ts on the closed
         #     episode when slot i transitions to a new id.
         #   - `_episode_meta[ep_id]` accumulates start/end timestamp,
-        #     which slot ran it, and n_calls, dumped as episodes.json
-        #     at shutdown.
-        # At shutdown, chunks are split by (slot, ep_id) and one .npz is
-        # written per episode.
+        #     which slot ran it, and n_calls, mirrored into episodes.json.
+        # Streaming save: the moment we detect a slot's episode id change,
+        # the *outgoing* episode's data is written to episode_XXXX.npz
+        # and dropped from RAM.  Peak memory is bounded by the size of the
+        # currently-open episodes, not the whole run.  Shutdown just flushes
+        # whatever is still open.
         self.capture_handle = None
         self.record_attention_dir: Path | None = None
-        self._chunks: list[dict] = []
+        # ep_id → list of per-slot single-call chunks (already sliced from
+        # the batched capture and cloned onto CPU numpy, so the source
+        # tensor can be freed).
+        self._open_episodes: dict[int, list[dict]] = {}
+        # Ep ids we've already streamed to disk — never re-open.
+        self._closed_episodes: set[int] = set()
+        # Growing manifest.  `_episodes_json_by_id` is a view for O(1) update.
+        self._episodes_json: list[dict] = []
+        self._episodes_json_by_id: dict[int, dict] = {}
+        self._meta_written: bool = False
+        # Block-index arrays are constant across calls — cache on first record.
+        self._cross_block_indices: np.ndarray | None = None
+        self._self_block_indices: np.ndarray | None = None
+        self._hidden_block_indices: np.ndarray | None = None
+        self._n_calls_total: int = 0
         self._call_idx: int = 0
         self._run_start_ts: float = time.time()
 
@@ -399,16 +414,23 @@ class CustomSimWrapper(PolicyWrapper):
                     "end_ts": None,
                     "n_calls": 0,
                 })
+                self._add_manifest_entry(int(ep_id), int(slot), now)
+            if self.record_attention_dir is not None and self._episodes_json:
+                self._write_manifest()
+            transitioned_out: list[int] = []
         else:
             # Subsequent calls: any slot whose id changed just started a new
             # episode.  Stamp end_ts on the outgoing episode and open a new
-            # entry for the incoming one.
+            # entry for the incoming one.  Collect outgoing ep_ids for an
+            # immediate flush-to-disk once bookkeeping is done.
+            transitioned_out = []
             for slot in range(batch_size):
                 incoming = int(slot_ep_ids[slot])
                 outgoing = int(self._last_slot_ep_ids[slot])
                 if incoming != outgoing:
                     if _is_valid(outgoing) and outgoing in self._episode_meta and self._episode_meta[outgoing]["end_ts"] is None:
                         self._episode_meta[outgoing]["end_ts"] = now
+                        transitioned_out.append(outgoing)
                     if _is_valid(incoming):
                         self._episode_meta.setdefault(incoming, {
                             "episode_id": incoming,
@@ -417,6 +439,7 @@ class CustomSimWrapper(PolicyWrapper):
                             "end_ts": None,
                             "n_calls": 0,
                         })
+                        self._add_manifest_entry(incoming, int(slot), now)
             self._last_slot_ep_ids = slot_ep_ids.copy()
 
         # Bump n_calls for every slot's currently active episode (excess slots
@@ -426,7 +449,29 @@ class CustomSimWrapper(PolicyWrapper):
             if _is_valid(ep_id) and ep_id in self._episode_meta:
                 self._episode_meta[ep_id]["n_calls"] += 1
 
+        # Stream any newly-closed episodes to disk right now, before their
+        # captures pile up in RAM.  This is the whole point of the refactor:
+        # the peak memory is bounded by "currently open episodes", not the
+        # whole run.
+        for ep_id in transitioned_out:
+            self._flush_episode(ep_id)
+
         return slot_ep_ids
+
+    @staticmethod
+    def _slot_slice_np(t, slot: int):
+        """Take a per-slot slice of a batched capture tensor and eagerly
+        materialise it as a CPU numpy array so the batched source (and any
+        GPU memory backing it) can be freed as soon as `_record_chunk`
+        returns.  All three capture tensors (`cross`, `self`, `hidden`) have
+        the batch/slot axis at dim=2.
+        """
+        if t is None:
+            return None
+        # .select() returns a view; .contiguous() forces a copy off the batched
+        # tensor's storage; .cpu() moves to host if the source lives on GPU;
+        # .numpy() gives us a plain array we can hand to np.savez later.
+        return t.select(dim=2, index=slot).contiguous().cpu().numpy()
 
     def _record_chunk(
         self,
@@ -434,136 +479,230 @@ class CustomSimWrapper(PolicyWrapper):
         captured: dict,
         slot_ep_ids: np.ndarray,
     ) -> None:
-        """Store one inference's capture. `video_batch` shape: (B, T, H, W, 3)."""
+        """Store one inference's capture, split per slot into the currently
+        open episodes.  Ep_ids that are already closed or marked -1 (excess
+        slot) are silently dropped.
+        """
         # Take latest frame per env → (B, H, W, 3) uint8.
         img = np.asarray(video_batch)
         if img.ndim == 5:
             img = img[:, -1]
-        self._chunks.append({
-            "call_idx": self._call_idx,
-            "timestamp": time.time() - self._run_start_ts,
-            "image": img.astype(np.uint8, copy=False),
-            "cross": captured.get("cross"),
-            "self":  captured.get("self"),
-            "hidden": captured.get("hidden_states"),
-            "cross_block_indices": captured.get("cross_block_indices", []),
-            "self_block_indices":  captured.get("self_block_indices", []),
-            "all_block_indices":   captured.get("all_block_indices", []),
-            # Per-slot episode id read from the client's observation — one
-            # entry per batch slot, dtype int32, shape (B,).
-            "slot_ep_ids": slot_ep_ids.copy(),
-        })
+        img = np.ascontiguousarray(img, dtype=np.uint8)
+
+        call_idx = self._call_idx
         self._call_idx += 1
-
-    def _save_attention(self) -> None:
-        """Flush self._chunks into per-episode npz files.
-
-        Save order is deliberately:
-          1. `episodes.json` (the manifest) — tiny, always written first,
-             marks each episode with `"written": false`.
-          2. `meta.json` — run-level config.
-          3. Each `episode_XXXX.npz` — huge, may take seconds each.  After
-             every successful write, `episodes.json` is atomically
-             rewritten with `"written": true` for that episode.
-
-        This means the downstream `pair_videos_to_episodes.py` can pair
-        against a partially-written run (or reconstruct from the npz
-        files alone if `episodes.json` never landed — it walks the dir
-        as a fallback).
-
-        Ctrl-C during the tensor writes is handled: we install a SIGINT
-        guard that catches the first interrupt, warns, and lets the
-        current npz finish; a second Ctrl-C is honoured and stops early.
-        Whatever episodes did land are already recorded in the manifest.
-        """
-        if not self._chunks or self.record_attention_dir is None:
-            return
-        # Idempotency guard: atexit + explicit finally will both call us.
-        if getattr(self, "_save_done", False):
-            return
-        self._save_done = True
-
-        import json
-        import signal
-
-        # Close out any episodes that were still "open" when the server died.
-        # Excess slots (ep_id == -1) don't have meta entries; skip them.
+        self._n_calls_total += 1
         now = time.time() - self._run_start_ts
-        if self._last_slot_ep_ids is not None:
-            for ep_id in self._last_slot_ep_ids.tolist():
-                ep_id = int(ep_id)
-                if ep_id < 0:
-                    continue
-                if self._episode_meta.get(ep_id, {}).get("end_ts") is None and ep_id in self._episode_meta:
-                    self._episode_meta[ep_id]["end_ts"] = now
 
-        # Constant across episodes:
-        cross_block_indices = np.array(
-            self._chunks[0]["cross_block_indices"], dtype=np.int32
-        )
-        self_block_indices = np.array(
-            self._chunks[0]["self_block_indices"], dtype=np.int32
-        )
-        hidden_block_indices = np.array(
-            self._chunks[0]["all_block_indices"], dtype=np.int32
-        )
-        image_mask = None
-        if self.capture_handle is not None and self.capture_handle.image_mask is not None:
-            image_mask = self.capture_handle.image_mask.numpy().astype(np.bool_)
+        cross_full  = captured.get("cross")
+        self_full   = captured.get("self")
+        hidden_full = captured.get("hidden_states")
 
-        # Group chunks by episode. For each episode we need a list of
-        # (chunk, slot_within_chunk) pointers.  Slots with ep_id == -1 are
-        # "excess" (the client's counter had already hit n_episodes) and
-        # we skip them here so no npz is written for their data.
-        episode_hits: dict[int, list[tuple[int, int]]] = {}
-        for chunk_idx, c in enumerate(self._chunks):
-            for slot, ep_id in enumerate(c["slot_ep_ids"]):
-                ep_id_i = int(ep_id)
-                if ep_id_i < 0:
-                    continue
-                episode_hits.setdefault(ep_id_i, []).append((chunk_idx, slot))
+        # Cache block-index arrays once — they're identical for every call.
+        if self._cross_block_indices is None:
+            self._cross_block_indices  = np.array(captured.get("cross_block_indices", []),  dtype=np.int32)
+            self._self_block_indices   = np.array(captured.get("self_block_indices", []),   dtype=np.int32)
+            self._hidden_block_indices = np.array(captured.get("all_block_indices", []),    dtype=np.int32)
 
-        # Build the manifest up front with `written: false` for every episode.
-        episodes_json: list[dict] = []
-        for ep_id in sorted(episode_hits.keys()):
-            hits = episode_hits[ep_id]
-            meta = self._episode_meta.get(ep_id, {"slot": hits[0][1]})
-            episodes_json.append({
-                "episode_id": int(ep_id),
-                "slot": int(meta.get("slot", hits[0][1])),
-                "start_ts": meta.get("start_ts"),
-                "end_ts": meta.get("end_ts"),
-                "n_calls": meta.get("n_calls", len(hits)),
-                "npz": f"episode_{ep_id:04d}.npz",
-                "written": False,
+        for slot, ep_id in enumerate(slot_ep_ids.tolist()):
+            ep_id = int(ep_id)
+            if ep_id < 0 or ep_id in self._closed_episodes:
+                continue
+            self._open_episodes.setdefault(ep_id, []).append({
+                "call_idx": call_idx,
+                "timestamp": now,
+                "image":  img[slot].copy(),  # (H, W, 3) uint8 — snap off the shared buffer
+                "cross":  self._slot_slice_np(cross_full,  slot),
+                "self":   self._slot_slice_np(self_full,   slot),
+                "hidden": self._slot_slice_np(hidden_full, slot),
             })
 
-        def _write_manifest() -> None:
-            """Atomic write of episodes.json (temp file + os.replace)."""
-            tmp = self.record_attention_dir / "episodes.json.tmp"
-            tmp.write_text(json.dumps(episodes_json, indent=2))
-            tmp.replace(self.record_attention_dir / "episodes.json")
+    def _add_manifest_entry(self, ep_id: int, slot: int, start_ts: float) -> dict:
+        """Register `ep_id` in `_episodes_json` if not already there.  Returns
+        the entry so callers can mutate it (n_calls, end_ts, written)."""
+        if ep_id in self._episodes_json_by_id:
+            return self._episodes_json_by_id[ep_id]
+        entry = {
+            "episode_id": int(ep_id),
+            "slot": int(slot),
+            "start_ts": float(start_ts),
+            "end_ts": None,
+            "n_calls": 0,
+            "npz": f"episode_{ep_id:04d}.npz",
+            "written": False,
+        }
+        self._episodes_json.append(entry)
+        self._episodes_json_by_id[ep_id] = entry
+        return entry
 
-        _write_manifest()
+    def _write_manifest(self) -> None:
+        """Atomic write of episodes.json.  Syncs `n_calls`/`end_ts` from
+        `_episode_meta` into every entry first so the on-disk manifest tracks
+        reality even for still-open episodes."""
+        if self.record_attention_dir is None:
+            return
+        import json
+        for entry in self._episodes_json:
+            meta = self._episode_meta.get(entry["episode_id"], {})
+            if "n_calls" in meta:
+                entry["n_calls"] = int(meta["n_calls"])
+            if meta.get("end_ts") is not None:
+                entry["end_ts"] = float(meta["end_ts"])
+        tmp = self.record_attention_dir / "episodes.json.tmp"
+        tmp.write_text(json.dumps(self._episodes_json, indent=2))
+        tmp.replace(self.record_attention_dir / "episodes.json")
 
-        # Run-level config lands early too so `meta.json` is always present.
-        meta_payload = {
-            "n_calls_total": len(self._chunks),
-            "n_episodes": len(episodes_json),
+    def _maybe_write_meta(self) -> None:
+        """Write the run-level meta.json exactly once (first flush)."""
+        if self._meta_written or self.record_attention_dir is None:
+            return
+        import json
+        payload = {
             "run_start": self._run_start_ts,
-            "run_end": time.time(),
             "grip_max_left": self.grip_max_left,
             "grip_max_right": self.grip_max_right,
             "empty_hand_proprio": self.empty_hand_proprio,
             "language_override": self.language_override,
             "episode_source": "client_slot_ep_ids",
+            "save_mode": "streaming_per_episode",
         }
         (self.record_attention_dir / "meta.json").write_text(
-            json.dumps(meta_payload, indent=2)
+            __import__("json").dumps(payload, indent=2)
         )
+        self._meta_written = True
 
-        # SIGINT tolerance: first Ctrl-C is buffered; second one raises.
-        # We restore the original handler at the end.
+    def _flush_episode(self, ep_id: int) -> None:
+        """Serialise one completed episode to `episode_XXXX.npz` and free its
+        RAM.  Called from `_read_slot_ep_ids` on a transition, and from
+        `_save_attention` on shutdown for any still-open episodes.  Safe to
+        call twice — closed episodes are skipped."""
+        if self.record_attention_dir is None:
+            return
+        if ep_id in self._closed_episodes:
+            return
+        chunks = self._open_episodes.get(ep_id)
+        if not chunks:
+            # Nothing captured for this ep_id (e.g. it was transitioned before
+            # any call was recorded, or the server started mid-episode).
+            self._closed_episodes.add(ep_id)
+            return
+
+        self._maybe_write_meta()
+
+        entry = self._episodes_json_by_id.get(ep_id)
+        if entry is None:
+            entry = self._add_manifest_entry(ep_id, 0, chunks[0]["timestamp"])
+
+        # Stack per-call arrays into (T, ...) tensors for the npz.
+        call_indices = np.array([c["call_idx"]  for c in chunks], dtype=np.int32)
+        timestamps   = np.array([c["timestamp"] for c in chunks], dtype=np.float64)
+        images       = np.stack([c["image"]     for c in chunks], axis=0)  # (T, H, W, 3)
+
+        payload: dict[str, Any] = {
+            "episode_id": np.int32(ep_id),
+            "slot":       np.int32(entry["slot"]),
+            "call_idx":   call_indices,
+            "timestamps": timestamps,
+            "images":     images,
+        }
+
+        def _stack_or_none(key: str):
+            vals = [c.get(key) for c in chunks]
+            if any(v is None for v in vals):
+                return None
+            try:
+                return np.stack(vals, axis=0)
+            except Exception as e:
+                print(f"[wrapper] failed to stack '{key}' for ep {ep_id}: {e}")
+                return None
+
+        cross = _stack_or_none("cross")
+        if cross is not None:
+            payload["attentions"] = cross
+            payload["block_indices"] = self._cross_block_indices
+
+        self_att = _stack_or_none("self")
+        if self_att is not None:
+            payload["self_attentions"] = self_att
+            payload["self_block_indices"] = self._self_block_indices
+
+        hidden = _stack_or_none("hidden")
+        if hidden is not None:
+            payload["hidden_states"] = hidden
+            payload["hidden_block_indices"] = self._hidden_block_indices
+
+        if self.capture_handle is not None and self.capture_handle.image_mask is not None:
+            payload["image_mask"] = self.capture_handle.image_mask.numpy().astype(np.bool_)
+
+        # Refresh manifest with written=False for this episode first, so a
+        # crash between here and the rename leaves an honest index.
+        self._write_manifest()
+
+        fname = entry["npz"]
+        out_path = self.record_attention_dir / fname
+        # NOTE the extension order: np.savez appends `.npz` if the filename
+        # doesn't already end in it — so we need `.tmp.npz`, not `.npz.tmp`,
+        # or we'd end up writing `<name>.npz.tmp.npz`.
+        tmp_path = self.record_attention_dir / (fname[:-4] + ".tmp.npz")
+        print(
+            f"[wrapper] flushing episode {ep_id:04d} ({len(chunks)} calls) -> {fname}",
+            flush=True,
+        )
+        np.savez(tmp_path, **payload)
+        tmp_path.replace(out_path)
+
+        entry["written"] = True
+        self._write_manifest()
+
+        # Free the per-call captures for this episode.  This is the whole
+        # point of the streaming refactor — RAM peak is now one open
+        # episode's worth, not the whole run.
+        del self._open_episodes[ep_id]
+        self._closed_episodes.add(ep_id)
+
+    def _save_attention(self) -> None:
+        """Shutdown flush.  Streaming saves already handled every episode
+        that ended cleanly during the run; this only touches episodes that
+        were still open when the server was told to stop.
+
+        SIGINT tolerance: first Ctrl-C lets the current episode's npz
+        finish; second Ctrl-C aborts the remaining flushes.  Anything
+        already on disk stays.
+        """
+        if self.record_attention_dir is None or self.capture_handle is None:
+            return
+        if getattr(self, "_save_done", False):
+            return
+        self._save_done = True
+
+        import signal
+
+        # Stamp end_ts on any still-open episodes so the manifest reflects
+        # reality even for episodes cut short by shutdown.
+        now = time.time() - self._run_start_ts
+        if self._last_slot_ep_ids is not None:
+            for ep_id in self._last_slot_ep_ids.tolist():
+                ep_id = int(ep_id)
+                if ep_id < 0 or ep_id in self._closed_episodes:
+                    continue
+                meta = self._episode_meta.get(ep_id)
+                if meta is not None and meta.get("end_ts") is None:
+                    meta["end_ts"] = now
+
+        remaining = sorted(self._open_episodes.keys())
+        if not remaining:
+            print(
+                f"[wrapper] shutdown: no open episodes to flush "
+                f"({len(self._closed_episodes)} already streamed, "
+                f"{self._n_calls_total} calls total) → {self.record_attention_dir}"
+            )
+            try:
+                self.capture_handle.detach()
+            except Exception as e:
+                print(f"[wrapper] capture_handle.detach failed: {e}")
+            return
+
+        # SIGINT tolerance for the shutdown flushes.
         _saved_handler = signal.getsignal(signal.SIGINT)
         _interrupt_state = {"count": 0}
 
@@ -571,11 +710,11 @@ class CustomSimWrapper(PolicyWrapper):
             _interrupt_state["count"] += 1
             if _interrupt_state["count"] == 1:
                 print(
-                    "\n[wrapper] Ctrl-C received during save — finishing current "
-                    "episode and stopping. Press Ctrl-C again to abort immediately."
+                    "\n[wrapper] Ctrl-C during shutdown flush — finishing "
+                    "current episode and stopping. Ctrl-C again to abort."
                 )
             else:
-                print("\n[wrapper] second Ctrl-C — aborting save.")
+                print("\n[wrapper] second Ctrl-C — aborting remaining flushes.")
                 signal.signal(signal.SIGINT, _saved_handler)
                 raise KeyboardInterrupt
 
@@ -583,108 +722,31 @@ class CustomSimWrapper(PolicyWrapper):
             signal.signal(signal.SIGINT, _on_sigint)
         except (ValueError, OSError):
             # signal.signal only works on the main thread; if we're being
-            # called from an atexit chain in a non-main thread, just skip
+            # called from an atexit chain on a non-main thread, just skip
             # the guard.
             pass
 
         try:
-            for ep_index, ep in enumerate(episodes_json):
+            for i, ep_id in enumerate(remaining):
                 if _interrupt_state["count"] >= 1:
-                    print(f"[wrapper] stopping early — {ep_index}/{len(episodes_json)} episodes written")
+                    print(f"[wrapper] stopping early — {i}/{len(remaining)} open episodes flushed")
                     break
-
-                ep_id = ep["episode_id"]
-                hits = episode_hits[ep_id]
-                slot = ep["slot"]
-
-                call_indices = np.array(
-                    [self._chunks[ci]["call_idx"] for ci, _ in hits], dtype=np.int32
-                )
-                timestamps = np.array(
-                    [self._chunks[ci]["timestamp"] for ci, _ in hits], dtype=np.float64
-                )
-                images = np.stack(
-                    [self._chunks[ci]["image"][s] for ci, s in hits], axis=0
-                )  # (T, H, W, 3)
-
-                payload: dict[str, Any] = {
-                    "episode_id": np.int32(ep_id),
-                    "slot": np.int32(slot),
-                    "call_idx": call_indices,
-                    "timestamps": timestamps,
-                    "images": images,
-                }
-
-                def _slice_or_none(key: str, slot_axis: int):
-                    vals = [self._chunks[ci][key] for ci, _ in hits]
-                    if not all(v is not None for v in vals):
-                        return None
-                    try:
-                        per_call_slot = []
-                        for (ci, s), v in zip(hits, vals):
-                            per_call_slot.append(v.select(dim=slot_axis, index=s))
-                        return torch.stack(per_call_slot, dim=0).numpy()
-                    except Exception as e:
-                        print(f"[wrapper] failed to slice '{key}' for ep {ep_id}: {e}")
-                        return None
-
-                cross = _slice_or_none("cross", slot_axis=2)
-                if cross is not None:
-                    payload["attentions"] = cross
-                    payload["block_indices"] = cross_block_indices
-
-                self_att = _slice_or_none("self", slot_axis=2)
-                if self_att is not None:
-                    payload["self_attentions"] = self_att
-                    payload["self_block_indices"] = self_block_indices
-
-                hidden = _slice_or_none("hidden", slot_axis=2)
-                if hidden is not None:
-                    payload["hidden_states"] = hidden
-                    payload["hidden_block_indices"] = hidden_block_indices
-
-                if image_mask is not None:
-                    payload["image_mask"] = image_mask
-
-                fname = ep["npz"]
-                out_path = self.record_attention_dir / fname
-                # Write to a `.tmp.npz` sibling and rename atomically so a
-                # partially-written file never lingers.  Note the extension
-                # order: np.savez appends `.npz` if the filename doesn't
-                # already end in it — so we need `.tmp.npz`, not `.npz.tmp`,
-                # or we'd end up writing `<name>.npz.tmp.npz`.
-                tmp_path = self.record_attention_dir / (fname[:-4] + ".tmp.npz")
-                print(
-                    f"[wrapper] writing episode {ep_id:04d} "
-                    f"({ep_index + 1}/{len(episodes_json)}, {len(hits)} calls) -> {fname}",
-                    flush=True,
-                )
-                np.savez(tmp_path, **payload)
-                tmp_path.replace(out_path)
-
-                # Mark this episode written and refresh the manifest so a
-                # crash between here and the next episode still leaves an
-                # accurate index on disk.
-                ep["written"] = True
-                _write_manifest()
+                self._flush_episode(ep_id)
         finally:
             try:
                 signal.signal(signal.SIGINT, _saved_handler)
             except (ValueError, OSError):
                 pass
 
-        # Also detach so the model is left clean if the process keeps living
-        # for any reason (e.g. an atexit chain).
         try:
-            if self.capture_handle is not None:
-                self.capture_handle.detach()
+            self.capture_handle.detach()
         except Exception as e:
             print(f"[wrapper] capture_handle.detach failed: {e}")
 
-        n_written = sum(1 for ep in episodes_json if ep.get("written"))
+        n_written = sum(1 for ep in self._episodes_json if ep.get("written"))
         print(
-            f"[wrapper] saved {n_written}/{len(episodes_json)} per-episode npz files "
-            f"({len(self._chunks)} calls total) to {self.record_attention_dir}"
+            f"[wrapper] shutdown: {n_written}/{len(self._episodes_json)} episodes saved "
+            f"({self._n_calls_total} calls total) → {self.record_attention_dir}"
         )
 
     def _dump_shapes(self, nested: dict[str, dict[str, Any]]) -> None:
