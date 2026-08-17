@@ -1,0 +1,92 @@
+[
+  {
+    "episode_id": 0,
+    "slot": 0,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0000.npz",
+    "written": true
+  },
+  {
+    "episode_id": 1,
+    "slot": 1,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0001.npz",
+    "written": true
+  },
+  {
+    "episode_id": 2,
+    "slot": 2,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0002.npz",
+    "written": true
+  },
+  {
+    "episode_id": 3,
+    "slot": 3,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0003.npz",
+    "written": true
+  },
+  {
+    "episode_id": 4,
+    "slot": 4,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0004.npz",
+    "written": true
+  },
+  {
+    "episode_id": 5,
+    "slot": 5,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0005.npz",
+    "written": true
+  },
+  {
+    "episode_id": 6,
+    "slot": 6,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0006.npz",
+    "written": true
+  },
+  {
+    "episode_id": 7,
+    "slot": 7,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0007.npz",
+    "written": true
+  },
+  {
+    "episode_id": 8,
+    "slot": 8,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0008.npz",
+    "written": true
+  },
+  {
+    "episode_id": 9,
+    "slot": 9,
+    "start_ts": 1.4674420356750488,
+    "end_ts": 236.2554976940155,
+    "n_calls": 25,
+    "npz": "episode_0009.npz",
+    "written": true
+  }
+]
