@@ -47,6 +47,20 @@ from gr00t.policy.gr00t_policy import Gr00tPolicy, Gr00tSimPolicyWrapper
 from gr00t.policy.server_client import PolicyServer
 
 
+# ─── Env language key + optional prefix strip (same as custom_sim_server.py) ──
+ENV_LANGUAGE_KEY = "annotation.human.coarse_action"
+LANGUAGE_PREFIXES = ("locked_waist: ", "unlocked_waist: ")
+
+
+def _strip_prefix(text):
+    if not isinstance(text, str):
+        return text
+    for p in LANGUAGE_PREFIXES:
+        if text.startswith(p):
+            return text[len(p):]
+    return text
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Wrapper — extends Gr00tSimPolicyWrapper with attention capture
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,15 +83,20 @@ class Gr00tBaseSimWrapper(Gr00tSimPolicyWrapper):
         policy: Gr00tPolicy,
         *,
         strict: bool = True,
+        language_override: str | None = None,
         record_attention_dir: str | None = None,
     ):
         super().__init__(policy, strict=strict)
         # store the concrete policy so we can reach into its DiT for capture
         self.policy = policy
+        self.language_override = language_override
 
         # One-shot shape dumps (analogous to custom_sim_server.py).
         self._dumped_obs_shapes = False
         self._dumped_action_shapes = False
+
+        if language_override is not None:
+            print(f"[wrapper] language_override active: {language_override!r}")
 
         # ── Attention capture bookkeeping (same structure as custom_sim_server.py) ──
         self.capture_handle = None
@@ -150,6 +169,40 @@ class Gr00tBaseSimWrapper(Gr00tSimPolicyWrapper):
         if not self._dumped_obs_shapes:
             self._dump_obs_shapes(observation)
             self._dumped_obs_shapes = True
+
+        # ── Language override + prefix strip ─────────────────────────────
+        # Same behavior as custom_sim_server.py: if --language-override is
+        # set, replace the env's language field with the override before
+        # anything downstream sees it.  Otherwise, strip the "locked_waist:"
+        # / "unlocked_waist:" prefix the env prepends by convention.
+        if ENV_LANGUAGE_KEY in observation:
+            observation = dict(observation)  # shallow copy so we don't mutate caller's dict
+            raw = observation[ENV_LANGUAGE_KEY]
+            if self.language_override is not None:
+                if isinstance(raw, (list, tuple)):
+                    observation[ENV_LANGUAGE_KEY] = type(raw)(
+                        [self.language_override] * len(raw)
+                    )
+                elif isinstance(raw, np.ndarray):
+                    observation[ENV_LANGUAGE_KEY] = np.array(
+                        [self.language_override] * raw.size
+                    ).reshape(raw.shape) if raw.ndim else np.array(self.language_override)
+                elif isinstance(raw, str):
+                    observation[ENV_LANGUAGE_KEY] = self.language_override
+                else:
+                    # unknown container — set it to the override as a string
+                    observation[ENV_LANGUAGE_KEY] = self.language_override
+            else:
+                if isinstance(raw, (list, tuple)):
+                    observation[ENV_LANGUAGE_KEY] = type(raw)(
+                        _strip_prefix(t) for t in raw
+                    )
+                elif isinstance(raw, np.ndarray):
+                    observation[ENV_LANGUAGE_KEY] = np.array(
+                        [_strip_prefix(t) for t in raw.reshape(-1).tolist()]
+                    ).reshape(raw.shape)
+                elif isinstance(raw, str):
+                    observation[ENV_LANGUAGE_KEY] = _strip_prefix(raw)
 
         # Reset capture, delegate, read.
         if self.capture_handle is not None:
@@ -565,6 +618,14 @@ class ServerConfig:
 
     strict: bool = True
 
+    language_override: str | None = None
+    """If set, replaces the env's `annotation.human.coarse_action` before it
+    reaches the model.  Useful for probing the same rollout with different
+    prompts (e.g. "Pick up the cube." vs "Pick up the object.") without
+    modifying the env.  When unset, the env's own task string is used, with
+    the "locked_waist:" / "unlocked_waist:" prefix stripped per the training
+    data convention."""
+
     record_attention_dir: str | None = None
     """If set, attach a CaptureHandle to the DiT and stream per-episode
     attention + hidden states to <this>/run_YYYYMMDD_HHMMSS/.
@@ -582,6 +643,7 @@ def main(cfg: ServerConfig):
     wrapped = Gr00tBaseSimWrapper(
         policy,
         strict=cfg.strict,
+        language_override=cfg.language_override,
         record_attention_dir=cfg.record_attention_dir,
     )
     print(f"[server] listening on {cfg.host}:{cfg.port}")
